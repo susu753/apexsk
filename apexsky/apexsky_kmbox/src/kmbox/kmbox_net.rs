@@ -11,12 +11,12 @@ use zerocopy::{AsBytes, FromBytes, FromZeroes};
 use super::KmboxError;
 
 #[derive(Debug)]
-#[repr(C)]
+#[repr(u32)]
 pub enum Cmd {
     Connect = 0xaf3c2828,       //ok连接盒子
     MouseMove = 0xaede7345,     //ok鼠标移动
-    MouseLeft = 0x9823AE8D,     //ok鼠标左键控制
-    MouseMiddle = 0x97a3AE8D,   //ok鼠标中键控制
+    MouseLeft = 0x9823ae8d,     //ok鼠标左键控制
+    MouseMiddle = 0x97a3ae8d,   //ok鼠标中键控制
     MouseRight = 0x238d8212,    //ok鼠标右键控制
     MouseWheel = 0xffeead38,    //ok鼠标滚轮控制
     MouseAutomove = 0xaede7346, //ok鼠标自动模拟人工移动控制
@@ -163,13 +163,13 @@ impl TrajectoryCorrectionStrength {
     /// 推荐取值范围16到50之间。
     /// Between 16 and 50
     pub fn recommended(value: u8) -> Self {
-        Self(value.max(16).min(50).into())
+        Self(value.clamp(16, 50).into())
     }
 
     /// 最大可以到100。
     /// Between 1 and 100
     pub fn enabled(value: u8) -> Self {
-        Self(value.max(1).min(100).into())
+        Self(value.clamp(1, 100).into())
     }
 }
 
@@ -234,6 +234,21 @@ impl KmboxNet {
         {
             Ok(r) => match r {
                 Ok((_number_of_bytes, _src_addr)) => Ok(rx_head),
+                Err(e) => Err(KmboxError::NetRx(e)),
+            },
+            Err(e) => Err(KmboxError::NetRxTimeout(e)),
+        }
+    }
+
+    async fn recv_packet_showpic(&self) -> Result<CmdHead, KmboxError> {
+        const LENGTH: usize = size_of::<CmdHead>() + 1024;
+        let mut buf: [u8; LENGTH] = [0; LENGTH];
+        match timeout(Duration::from_secs(10), self.socket.recv_from(&mut buf)).await {
+            Ok(r) => match r {
+                Ok((_number_of_bytes, _src_addr)) => {
+                    CmdHead::read_from(&buf[0..size_of::<CmdHead>()])
+                        .ok_or(KmboxError::AnyError(anyhow::anyhow!("recv head")))
+                }
                 Err(e) => Err(KmboxError::NetRx(e)),
             },
             Err(e) => Err(KmboxError::NetRxTimeout(e)),
@@ -330,7 +345,7 @@ impl KmboxNet {
                 }),
             )
             .await?;
-            self.check_rx_packet_head(self.recv_packet_head().await?)?;
+            self.check_rx_packet_head(self.recv_packet_showpic().await?)?;
         }
         Ok(())
     }
@@ -405,7 +420,7 @@ impl KmboxNet {
                 CmdBody::U16Buff(CmdDataU16 { buff: *data }),
             )
             .await?;
-            self.check_rx_packet_head(self.recv_packet_head().await?)?;
+            self.check_rx_packet_head(self.recv_packet_showpic().await?)?;
         }
 
         Ok(())
@@ -527,10 +542,10 @@ impl KmboxNet {
     }
 
     /// 二阶贝塞尔曲线控制
-    /// x,y 	:目标点坐标
-    /// ms		:拟合此过程用时（单位ms）
-    /// x1,y1	:控制点p1点坐标
-    /// x2,y2	:控制点p2点坐标
+    /// x,y     :目标点坐标
+    /// ms      :拟合此过程用时（单位ms）
+    /// x1,y1   :控制点p1点坐标
+    /// x2,y2   :控制点p2点坐标
     ///
     /// Second-order Bézier curve control
     /// x,y : coordinates of the target point.
@@ -539,14 +554,15 @@ impl KmboxNet {
     /// x2,y2 :coordinates of point p2.
     pub async fn mouse_move_beizer(
         &mut self,
-        x: i32,
-        y: i32,
+        p: (i32, i32),
         ms: u32,
-        x1: i32,
-        y1: i32,
-        x2: i32,
-        y2: i32,
+        p1: (i32, i32),
+        p2: (i32, i32),
     ) -> Result<(), KmboxError> {
+        let (x, y) = p;
+        let (x1, y1) = p1;
+        let (x2, y2) = p2;
+
         self.soft_mouse.x = x;
         self.soft_mouse.y = y;
         self.soft_mouse.point[0] = x1;

@@ -4,6 +4,8 @@ use egui::{pos2, Color32};
 use obfstr::obfstr as s;
 use once_cell::sync::Lazy;
 
+use super::ID_RADAR_WINDOW;
+
 struct RadarSettings {
     radar: bool,
     radar_guides: bool,
@@ -50,6 +52,7 @@ pub(super) fn mini_map_radar(
     local_pos: [f32; 3],
     local_yaw: f32,
     enemy_data: Vec<RadarTarget>,
+    default_position: (f32, f32),
     mini_map_radar_dot_size1: f32,
     mini_map_radar_dot_size2: f32,
 ) {
@@ -57,13 +60,28 @@ pub(super) fn mini_map_radar(
         return;
     }
 
+    let radar_size_scale = {
+        let screen_size_default = (1920.0_f32.powi(2) + 1080.0_f32.powi(2)).sqrt();
+
+        let egui::Vec2 {
+            x: screen_width,
+            y: screen_height,
+        } = ctx.screen_rect().size();
+
+        let screen_size = (screen_width.powi(2) + screen_height.powi(2)).sqrt();
+        screen_size / screen_size_default
+    };
+    let radar_rect_default: f32 = 250.0;
+    let radar_rect_size = radar_rect_default * radar_size_scale;
+
     egui::Window::new(s!("Radar"))
+        .id(*ID_RADAR_WINDOW)
         .resizable(false)
         .title_bar(true)
         .movable(true)
         .frame(egui::Frame::none())
-        .default_pos((45.0, 45.0))
-        .fixed_size((250.0, 250.0))
+        .default_pos(default_position)
+        .fixed_size((radar_rect_size, radar_rect_size))
         .show(ctx, |ui| {
             let draw_rect = ui.clip_rect();
             let mid_radar = pos2(
@@ -97,6 +115,7 @@ pub(super) fn mini_map_radar(
                     target.distance,
                     target.team_id,
                     draw_rect,
+                    radar_size_scale,
                     mini_map_radar_dot_size1,
                     mini_map_radar_dot_size2,
                 );
@@ -113,6 +132,7 @@ fn draw_radar_point_mini_map(
     target_distance: f32,
     target_team_index: i32,
     draw_rect: egui::Rect,
+    radar_size_scale: f32,
     mini_map_radar_dot_size1: f32,
     mini_map_radar_dot_size2: f32,
 ) {
@@ -124,7 +144,7 @@ fn draw_radar_point_mini_map(
         draw_rect.width(),
         draw_rect.height(),
         local_yaw,
-        0.3,
+        0.3 * radar_size_scale,
     );
     if target_distance > 0.0 && target_distance < RADAR_SETTINGS.distance_radar as f32 {
         draw_radar_dot(

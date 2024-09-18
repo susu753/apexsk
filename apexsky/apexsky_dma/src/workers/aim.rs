@@ -1,8 +1,9 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
 use apexsky::aimbot::{
-    AimAngles, AimEntity, Aimbot, AimbotSettings, CurrentWeaponInfo, TriggerBot,
+    AimAngles, AimEntity, Aimbot, AimbotSettings, CurrentWeaponInfo, HitScanReport, TriggerBot,
 };
 use apexsky::config::DeviceConfig;
 use apexsky::global_state::G_STATE;
@@ -11,8 +12,7 @@ use apexsky_dmalib::access::MemApi;
 use apexsky_kmbox::kmbox::{KmboxB, KmboxNet};
 use apexsky_proto::pb::apexlegends::{AimKeyState, AimTargetInfo};
 use obfstr::obfstr as s;
-use parking_lot::RwLock;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, sleep_until, Instant};
 use tracing::{instrument, trace};
 
@@ -20,19 +20,22 @@ use crate::actuator::{
     AimActuator, AimbotAction, DeviceAimActuator, KmboxAimActuator, MemAimHelper, QmpAimActuator,
 };
 use crate::apexdream::base::math;
-use crate::SharedState;
+use crate::usermod_thr::UserModEvent;
+use crate::SharedStateWrapper;
 
 const ENABLE_MEM_AIM: bool = true;
 
 pub trait ContextForAimbot {
     async fn get_aimbot_settings(&self) -> Option<AimbotSettings>;
     async fn get_entity(&self, target_ptr: u64) -> Option<Arc<dyn AimEntity>>;
-    async fn get_frame_count(&self) -> u32;
-    async fn get_game_fps(&self) -> f32;
     async fn get_held_id(&self) -> Option<i32>;
     async fn get_weapon_info(&self) -> Option<CurrentWeaponInfo>;
-    async fn is_world_ready(&self) -> bool;
-    async fn update_aim_target_for_esp(&mut self, position: [f32; 3]);
+    async fn update_aim_target_for_esp(
+        &mut self,
+        aim_result: AimAngles,
+        hitscan_result: Option<HitScanReport>,
+        target_pos: Option<[f32; 3]>,
+    );
 }
 
 async fn create_aim_actuator_from_device(
@@ -59,18 +62,27 @@ async fn create_aim_actuator_from_device(
 #[instrument(skip_all)]
 pub async fn aimbot_loop(
     mut active: watch::Receiver<bool>,
-    mut state: Arc<RwLock<SharedState>>,
+    mut state: SharedStateWrapper,
     access_tx: MemApi,
+    usermod_event_tx: mpsc::UnboundedSender<UserModEvent>,
     mut aim_key_rx: watch::Receiver<AimKeyState>,
     mut aim_select_rx: watch::Receiver<Vec<AimTargetInfo>>,
 ) -> anyhow::Result<()> {
     tracing::debug!("{}", s!("task start"));
 
+    let usermod_send_event = |event: UserModEvent| {
+        if let Err(e) = usermod_event_tx.send(event) {
+            tracing::error!(%e, "{}", s!("usermod_send_event"));
+        };
+    };
+
     let mut start_instant = Instant::now();
     let mut aimbot = Aimbot::default();
-    let mut natural_delta_viewangles: [f32; 3] = [0.0, 0.0, 0.0];
+    let mut assist_score = 0;
+    let mut natural_delta_viewangles: VecDeque<[f32; 3]> = VecDeque::with_capacity(20);
     let mut prev_recoil_angle: [f32; 3] = [0.0, 0.0, 0.0];
     let mut prev_view_angles: Option<[f32; 3]> = None;
+    let mut prev_aim_target_id: u64 = 0;
     let mut mem_aim_helper = MemAimHelper {
         mem: access_tx.clone(),
         apex_base: 0,
@@ -93,30 +105,29 @@ pub async fn aimbot_loop(
         start_instant = Instant::now();
 
         // Check game_attached and world_ready
-        if !state.is_world_ready().await {
+        if !state.is_world_ready() {
             tracing::trace!("{}", s!("waiting for world ready"));
             start_instant += Duration::from_millis(500);
             sleep_until(start_instant).await;
             continue;
         }
         // Check base_addr and local_player_ptr
-        {
-            let rlock = state.read();
-            mem_aim_helper.apex_base = rlock.game_baseaddr.unwrap_or(0);
-            mem_aim_helper.lplayer_ptr = rlock
-                .local_player
-                .as_ref()
-                .map(|e| e.get_entity().entity_ptr.into_raw())
-                .unwrap_or(0);
-        }
+        mem_aim_helper.apex_base = state.get_game_baseaddr().unwrap_or(0);
+        mem_aim_helper.lplayer_ptr = state.get_local_player_ptr().unwrap_or(0);
+
         if !mem_aim_helper.ready() {
             tracing::trace!("{}", s!("waiting for mem_aim_executer ready"));
             start_instant += Duration::from_millis(500);
             sleep_until(start_instant).await;
             continue;
         }
+
         // Check local_player entity
-        let Some(local_entity) = state.get_entity(mem_aim_helper.lplayer_ptr).await else {
+        if !state
+            .players
+            .read()
+            .contains_key(&mem_aim_helper.lplayer_ptr)
+        {
             tracing::trace!("{}", s!("waiting for local player ready"));
             start_instant += Duration::from_millis(500);
             sleep_until(start_instant).await;
@@ -157,6 +168,7 @@ pub async fn aimbot_loop(
             aimbot.update_attack_state(key_status.attack_button);
             aimbot.update_zoom_state(key_status.zoom_button);
             aimbot.update_triggerbot_key_state(key_status.triggerbot_hotkey);
+            aimbot.update_quick_looting_key_state(key_status.quick_looting_hotkey);
         }
 
         // Receive pre-selected targets and update it to aimbot
@@ -171,6 +183,8 @@ pub async fn aimbot_loop(
                     t.distance,
                     t.is_visible,
                     t.love_status == LoveStatus::Love as i32,
+                    t.is_npc,
+                    t.is_loot,
                     t.entity_ptr,
                 );
             });
@@ -179,7 +193,7 @@ pub async fn aimbot_loop(
 
         // Update aimbot settings
         // Lower update frequency to reduce cpu usage
-        if state.get_frame_count().await % 30 == 0 {
+        if state.get_frame_count() % 30 == 0 {
             if let Some(aimbot_settings) = state.get_aimbot_settings().await {
                 aimbot.settings(aimbot_settings);
                 trace!("{}", s!("aimbot_settings reload"));
@@ -187,76 +201,97 @@ pub async fn aimbot_loop(
         }
 
         // Update Aimbot state
-        aimbot.update(mem_aim_helper.lplayer_ptr, state.get_game_fps().await);
+        aimbot.update(mem_aim_helper.lplayer_ptr, state.get_game_fps());
 
         let aiming = aimbot.is_aiming();
         //tracing::trace!(?aiming, "711aac39-e83c-4788");
 
-        let mut target_pos: Option<[f32; 3]> = None;
-        let aim_result = {
-            let aim_entity_ptr = aimbot.get_aim_entity();
-            if aim_entity_ptr == 0 {
-                aimbot.cancel_locking();
-                AimAngles::default()
-            } else if let Some(target_entity) = state.get_entity(aim_entity_ptr).await {
-                target_pos = Some(target_entity.get_position());
+        let aim_entity_ptr = aimbot.get_aim_entity();
+        let target_entity: Option<Arc<dyn AimEntity>> = state.get_entity(aim_entity_ptr).await;
+        let Some(local_entity) = state.get_entity(mem_aim_helper.lplayer_ptr).await else {
+            continue;
+        };
 
-                // // debug target entity
-                // if !target_entity.is_player() {
-                //     let is_visible = target_entity.is_visible();
-                //     trace!(is_visible, ?target_entity, "{}", s!("711aac39-e83c-444b"));
-                // }
+        let (aim_result, hitscan, target_pos): (
+            AimAngles,
+            Option<HitScanReport>,
+            Option<[f32; 3]>,
+        ) = if let Some(ref target_entity) = target_entity {
+            // // debug target entity
+            // if !target_entity.is_player() {
+            //     let is_visible = target_entity.is_visible();
+            //     trace!(is_visible, ?target_entity, "{}", s!("711aac39-e83c-444b"));
+            // }
 
-                if !(aimbot.is_aiming() || aimbot.is_triggerbot_ready()) {
-                    AimAngles::default()
-                } else if aimbot.get_gun_safety() {
-                    trace!("{}", s!("711aac39-e83c-4788 safety on"));
-                    //println!("{:?}", target_entity);
-                    AimAngles::default()
-                } else if local_entity.is_knocked()
-                    || !target_entity.is_alive()
-                    || target_entity.is_knocked()
-                {
-                    trace!(
-                        ?target_entity,
-                        ?local_entity,
-                        "{}",
-                        s!("711aac39-e83c-4788 not target")
-                    );
-                    aimbot.cancel_locking();
-                    AimAngles::default()
-                } else {
-                    trace!("{}", s!("711aac39-e83c-4788 calc best aim"));
-                    let (aim_angles, position) =
-                        aimbot.calc_best_aim(&*local_entity, &*target_entity);
-                    trace!(?aim_angles, "{}", s!("711aac39-e83c-4788 best aim"));
-                    target_pos = Some(position);
-                    aim_angles
-                }
-            } else {
-                //tracing::warn!(aim_entity_ptr, "{}", s!("targeted entity does not exist"));
-                tracing::debug!(
-                    aim_entity_ptr,
+            if !(aimbot.is_aiming() || aimbot.is_triggerbot_ready()) {
+                (
+                    AimAngles::default(),
+                    None,
+                    Some(target_entity.get_position()),
+                )
+            } else if aimbot.get_gun_safety() {
+                trace!("{}", s!("711aac39-e83c-4788 safety on"));
+                //println!("{:?}", target_entity);
+                (
+                    AimAngles::default(),
+                    None,
+                    Some(target_entity.get_position()),
+                )
+            } else if local_entity.is_knocked()
+                || !target_entity.is_alive()
+                || target_entity.is_knocked()
+            {
+                trace!(
+                    ?target_entity,
+                    ?local_entity,
                     "{}",
-                    s!("711aac39-e83c-4788 targeted entity does not exist")
+                    s!("711aac39-e83c-4788 not target")
                 );
                 aimbot.cancel_locking();
-                AimAngles::default()
+                (
+                    AimAngles::default(),
+                    None,
+                    Some(target_entity.get_position()),
+                )
+            } else {
+                trace!("{}", s!("711aac39-e83c-4788 calc best aim"));
+                let Some(view_angles) = read_view_angles(&mem_aim_helper).await else {
+                    continue;
+                };
+                let (aim_angles, hitscan, position) = aimbot.calc_best_aim(
+                    local_entity.as_ref(),
+                    target_entity.as_ref(),
+                    view_angles,
+                );
+                trace!(?aim_angles, "{}", s!("711aac39-e83c-4788 best aim"));
+                (aim_angles, Some(hitscan), Some(position))
             }
+        } else {
+            //tracing::warn!(aim_entity_ptr, "{}", s!("targeted entity does not exist"));
+            tracing::debug!(
+                aim_entity_ptr,
+                "{}",
+                s!("711aac39-e83c-4788 targeted entity does not exist")
+            );
+            aimbot.cancel_locking();
+            (AimAngles::default(), None, None)
         };
+
         if aiming {
             tracing::debug!(?aim_result, "711aac39-e83c-4788");
         }
 
         if let Some(pos) = target_pos {
             tracing::trace!(target_pos = ?pos, ?aim_result);
-            state.update_aim_target_for_esp(pos).await;
         }
+        state
+            .update_aim_target_for_esp(aim_result.clone(), hitscan, target_pos)
+            .await;
 
         // Update Trigger Bot state
         // Ensure that the triggerbot is updated,
         // otherwise there may be issues with not canceling after firing.
-        aimbot.triggerbot_update(&aim_result, aim_key_rx.borrow().attack_state);
+        aimbot.triggerbot_update(target_entity, &aim_result, aim_key_rx.borrow().attack_state);
         if aiming {
             tracing::debug!("711aac39-e83c-4788 trigger updated");
         }
@@ -267,32 +302,96 @@ pub async fn aimbot_loop(
 
         // Aim Assist
         if aimbot.is_aiming() && aim_result.valid {
-            let view_angles = [aim_result.view_pitch, aim_result.view_yew, 0.0];
+            let view_angles = [aim_result.view_pitch, aim_result.view_yaw, 0.0];
             let smoothed_angles = aimbot.smooth_aim_angles(&aim_result, smooth_factor);
             let smoothed_angles = [smoothed_angles.0, smoothed_angles.1, 0.0];
             let smoothed_delta_angles = math::sub(smoothed_angles, view_angles);
 
             if aimbot_settings.aim_mode & 0x4 != 0 && !aimbot.is_grenade() {
-                let natural_delta = natural_delta_viewangles;
+                let natural_viewangle_vel = {
+                    let arr = natural_delta_viewangles.clone();
+                    let arr_len = arr.len() as usize;
+                    let all_sum_values = arr
+                        .into_iter()
+                        .reduce(|acc, e| math::add(acc, e))
+                        .unwrap_or_default();
+                    let mean = math::muls(all_sum_values, 1.0 / arr_len as f32);
+                    mean
+                };
+
                 //println!("{:?}", natural_delta);
 
-                fn check(natural_delta: f32, smoothed_delta: f32) -> f32 {
-                    if !natural_delta.is_normal() {
+                #[inline]
+                fn check(natural_viewangle_vel: f32, smoothed_delta: f32, score: &mut i32) -> f32 {
+                    //println!("{natural_viewangle_vel:?} {score:?}");
+
+                    if !natural_viewangle_vel.is_normal() {
                         return 0.0;
                     }
-                    if (smoothed_delta.signum() * natural_delta.signum()).is_sign_positive() {
-                        smoothed_delta.abs().min(natural_delta.abs() * 7.0)
-                            * smoothed_delta.signum()
+
+                    let bingo = (smoothed_delta.signum() * natural_viewangle_vel.signum())
+                        .is_sign_positive();
+
+                    if bingo {
+                        //println!("bingo");
+                        if *score < 0 {
+                            *score = 0;
+                        }
+                        *score += (natural_viewangle_vel * 1000.0).round().abs() as i32;
                     } else {
-                        smoothed_delta.abs().min(natural_delta.abs() * 0.7)
-                            * smoothed_delta.signum()
+                        *score -= (natural_viewangle_vel * 1000.0).round().abs() as i32;
+                    }
+
+                    let _score_abs = {
+                        let abs = score.abs();
+                        if abs > 100 {
+                            *score = score.signum() * 100;
+                            100
+                        } else {
+                            abs
+                        }
+                    };
+
+                    if *score > 0 {
+                        if bingo {
+                            let max_accel_x = 40.0;
+                            smoothed_delta.signum()
+                                * f32::min(
+                                    smoothed_delta.abs(),
+                                    natural_viewangle_vel.abs() * max_accel_x,
+                                )
+                        } else {
+                            let max_decel_x = 20.0;
+                            smoothed_delta.signum()
+                                * f32::min(
+                                    smoothed_delta.abs(),
+                                    natural_viewangle_vel.abs() * max_decel_x,
+                                )
+                        }
+                    } else {
+                        0.0
                     }
                 }
+
+                if aim_entity_ptr != prev_aim_target_id {
+                    assist_score = 0;
+                    prev_aim_target_id = aim_entity_ptr;
+                }
+
                 let assist_delta = [
-                    check(natural_delta[0], smoothed_delta_angles[0]),
-                    check(natural_delta[1], smoothed_delta_angles[1]),
+                    check(
+                        natural_viewangle_vel[0],
+                        smoothed_delta_angles[0],
+                        &mut assist_score,
+                    ),
+                    check(
+                        natural_viewangle_vel[1],
+                        smoothed_delta_angles[1],
+                        &mut assist_score,
+                    ),
                     smoothed_delta_angles[2],
                 ];
+                //println!("{assist_score:?}");
                 if assist_delta[0].is_normal() || assist_delta[1].is_normal() {
                     shift_angles = Some(assist_delta);
                 }
@@ -347,30 +446,33 @@ pub async fn aimbot_loop(
                 4 => Some(false),
                 _ => None,
             },
+            force_use: match aimbot.poll_looting_action() {
+                5 => Some(true),
+                4 => Some(false),
+                _ => None,
+            },
         };
 
         // Update state for ESP
-        state.write().aimbot_state = Some((aimbot.clone(), loop_duration));
+        *state.aimbot_state.lock() = Some((aimbot.clone(), loop_duration));
+
+        // Update state for UserMod
+        usermod_send_event(UserModEvent::AimbotTick(aimbot.clone(), aim_result));
 
         // Read view_angles
-        let view_angles =
-            match MemAimHelper::read_viewangles(&access_tx, mem_aim_helper.lplayer_ptr).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(%e, "{}", s!("err read viewangles"));
-                    continue;
-                }
-            };
-        if !(view_angles[0].is_finite() && view_angles[1].is_finite() && view_angles[2].is_finite())
-        {
-            tracing::warn!(?view_angles, "{}", s!("got invalid view_angles"));
+        let Some(view_angles) = read_view_angles(&mem_aim_helper).await else {
             continue;
-        }
+        };
 
         // Calc delta_view_angles
-        natural_delta_viewangles = prev_view_angles
-            .map(|prev| math::sub(view_angles, prev))
-            .unwrap_or([0.0, 0.0, 0.0]);
+        if natural_delta_viewangles.len() >= 20 {
+            natural_delta_viewangles.pop_front();
+        }
+        natural_delta_viewangles.push_back(
+            prev_view_angles
+                .map(|prev| math::sub(view_angles, prev))
+                .unwrap_or([0.0, 0.0, 0.0]),
+        );
 
         // Perform aimbot action
         if let Some(ref mut actuator) = aim_actuator {
@@ -387,4 +489,89 @@ pub async fn aimbot_loop(
     tracing::debug!("{}", s!("task end"));
 
     Ok(())
+}
+
+async fn read_view_angles(mem_aim_helper: &MemAimHelper) -> Option<[f32; 3]> {
+    let view_angles = match MemAimHelper::read_viewangles(
+        &mem_aim_helper.mem,
+        mem_aim_helper.lplayer_ptr,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(%e, "{}", s!("err read viewangles"));
+            return None;
+        }
+    };
+    if !(view_angles[0].is_finite() && view_angles[1].is_finite() && view_angles[2].is_finite()) {
+        tracing::warn!(?view_angles, "{}", s!("got invalid view_angles"));
+        return None;
+    }
+    Some(view_angles)
+}
+
+struct AimingInfo {
+    pub local_origin: [f32; 3],
+    pub view_angles: [f32; 3],
+    pub target_origin: [f32; 3],
+    pub target_vel: [f32; 3],
+}
+
+async fn read_aiming_info(
+    mem_aim_helper: &MemAimHelper,
+    target: &dyn AimEntity,
+) -> anyhow::Result<AimingInfo> {
+    use apexsky::offsets::G_OFFSETS;
+    use apexsky_dmalib::access::{AccessType, PendingAccessRequest, PendingMemRead};
+    use std::mem::size_of;
+
+    let lplayer_ptr = mem_aim_helper.lplayer_ptr;
+    let target_ptr = target.get_entity_ptr();
+    let mem = &mem_aim_helper.mem;
+
+    let reqs = (
+        AccessType::mem_read(
+            lplayer_ptr + G_OFFSETS.centity_origin,
+            size_of::<[f32; 3]>(),
+            0,
+        ),
+        AccessType::mem_read(
+            lplayer_ptr + G_OFFSETS.player_viewangles,
+            size_of::<[f32; 3]>(),
+            0,
+        ),
+        AccessType::mem_read(
+            target_ptr + G_OFFSETS.centity_origin,
+            size_of::<[f32; 3]>(),
+            0,
+        ),
+        AccessType::mem_read(
+            target_ptr + G_OFFSETS.centity_velocity,
+            size_of::<[f32; 3]>(),
+            0,
+        ),
+    );
+    let futs = tokio::try_join!(
+        reqs.0.with_priority(10).dispatch(mem),
+        reqs.1.with_priority(10).dispatch(mem),
+        reqs.2.with_priority(10).dispatch(mem),
+        reqs.3.with_priority(10).dispatch(mem),
+    )?;
+    let vals = tokio::try_join!(
+        futs.0.recv_for::<[f32; 3]>(),
+        futs.1.recv_for::<[f32; 3]>(),
+        futs.2.recv_for::<[f32; 3]>(),
+        futs.3.recv_for::<[f32; 3]>(),
+    )?;
+    Ok(AimingInfo {
+        local_origin: vals.0,
+        view_angles: vals.1,
+        target_origin: vals.2,
+        target_vel: if target.is_player() {
+            vals.3
+        } else {
+            target.get_abs_velocity()
+        },
+    })
 }

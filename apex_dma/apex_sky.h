@@ -19,20 +19,22 @@ typedef struct {
   float skynade_dist;
   float smooth;
   float skynade_smooth;
+  float looting_smooth;
   float recoil_smooth_x;
   float recoil_smooth_y;
 } aimbot_settings_t;
 
 typedef struct {
   bool valid;
+  bool hitscan;
   float view_pitch;
-  float view_yew;
+  float view_yaw;
   float delta_pitch;
-  float delta_yew;
+  float delta_yaw;
   float delta_pitch_min;
   float delta_pitch_max;
-  float delta_yew_min;
-  float delta_yew_max;
+  float delta_yaw_min;
+  float delta_yaw_max;
   float distance;
 } aim_angles_t;
 
@@ -70,9 +72,12 @@ typedef struct {
   int triggerbot_state;
   uint64_t triggerbot_trigger_time;
   uint64_t triggerbot_release_time;
+  int32_t quick_looting_state;
+  bool quick_looting_ready;
 } aimbot_state_t;
 
 typedef struct {
+  bool bone;
   bool box;
   bool line;
   bool distance;
@@ -227,6 +232,7 @@ typedef struct {
   int aimbot_hot_key_1;
   int aimbot_hot_key_2;
   int trigger_bot_hot_key;
+  int quick_looting_hot_key;
   bool loot_filled_toggle;
   bool player_filled_toggle;
   bool super_key_toggle;
@@ -309,6 +315,8 @@ typedef struct {
   uintptr_t input_system;
   uintptr_t input_button_state;
   uintptr_t name_list;
+  uintptr_t highlight_settings;
+  uintptr_t spectator_list;
   uintptr_t network_var_table_ptr;
   uintptr_t network_var_table_len;
   uintptr_t host_map;
@@ -341,9 +349,15 @@ typedef struct {
   uintptr_t centity_abs_velocity;
   uintptr_t centity_velocity;
   uintptr_t entity_owner_entity;
+  uintptr_t entity_collision;
+  uintptr_t entity_collision_group;
   uintptr_t entiry_name;
   uintptr_t entity_sign_name;
   uintptr_t entity_fade_dist;
+  uintptr_t bone_follower_model_index;
+  uintptr_t bone_follower_bone_index;
+  uintptr_t collision_property_vec_mins;
+  uintptr_t collision_property_vec_maxs;
   uintptr_t animating_skin;
   uintptr_t animating_bone_array;
   uintptr_t bones;
@@ -368,6 +382,7 @@ typedef struct {
   uintptr_t cplayer_wall_run_clear_time;
   uintptr_t player_viewangles;
   uintptr_t player_consumables;
+  uintptr_t player_traversal_release_time;
   uintptr_t player_observer_state;
   uintptr_t player_ovserver_target;
   uintptr_t player_platform_uid;
@@ -400,13 +415,20 @@ typedef struct {
   uintptr_t weaponx_charge_end_time;
   uintptr_t weaponx_last_charge_frac;
   uintptr_t cweaponx_burst_fire;
-  uintptr_t cweaponx_bullet_speed;
-  uintptr_t cweaponx_bullet_scale;
   uintptr_t cweaponx_crosshair_last;
   uintptr_t weaponx_bitfield_from_player;
   uintptr_t weaponx_weapon_name_index;
+  uintptr_t weaponx_printname;
+  uintptr_t weaponx_shortprintname;
+  uintptr_t weaponx_fire_rate;
+  uintptr_t weaponx_fire_duration;
   uintptr_t weaponx_is_semi_auto;
-  uintptr_t weaponx_projectile_speed;
+  uintptr_t weaponx_ammo_clip_size;
+  uintptr_t weaponx_grenade_view_launch_offset;
+  uintptr_t weaponx_projectile_launch_speed;
+  uintptr_t weaponx_projectile_launch_pitch_offset;
+  uintptr_t weaponx_projectile_gravity_scale;
+  uintptr_t weaponx_projectile_air_friction;
   uintptr_t vehicle_driver;
   uintptr_t vehicle_velocity;
   uintptr_t prop_survival;

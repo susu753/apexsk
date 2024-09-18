@@ -72,8 +72,8 @@ impl EntityList {
         let prev_info = unsafe { self.prev_info.get_unchecked(..sdk::NUM_ENT_ENTRIES) };
         let ent_info = unsafe { self.ent_info.get_unchecked(..sdk::NUM_ENT_ENTRIES) };
         let entities = unsafe { self.entities.get_unchecked_mut(..sdk::NUM_ENT_ENTRIES) };
-        let mut futs_recreate = vec![];
-        let mut futs_update = vec![];
+        let mut futs_recreate = Vec::new();
+        let mut futs_update = Vec::with_capacity(sdk::MAX_PLAYERS);
         let mut start_recreate = |index: usize, entity_ptr: sdk::Ptr| {
             futs_recreate.push((
                 index,
@@ -231,6 +231,8 @@ impl GetClientEntity {
             // 	Some(BaseEntity::new(entity_ptr, index, &data.client_class))
             // },
             _ => {
+                // let name = base::from_utf8_buf(&data.name_buf);
+                //tracing::warn!("{}{}{}{name:?}", s!("Uninteresting["), index, s!("]: "));
                 if log_uninteresting {
                     let name = base::from_utf8_buf(&data.name_buf);
                     api.log(format!(

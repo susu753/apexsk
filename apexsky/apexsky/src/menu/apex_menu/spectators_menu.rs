@@ -1,19 +1,18 @@
-use crate::{config, i18n_msg, lock_config, lock_mod, love_players::LovePlayer};
-use fluent::{FluentBundle, FluentResource};
+use crate::{config, i18n::I18nBundle, i18n_msg, lock_config, love_players::LovePlayer};
 use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span},
     widgets::ListItem,
 };
-use skyapex_sdk::module::SpecCheck;
 
-use super::{item_text, MenuBuilder, MenuLevel, MenuState, TerminalMenu};
+use super::{item_text, GeneralMenu, MenuBuilder, MenuLevel, TerminalMenu};
 
 pub(super) fn build_spectators_menu(
-    i18n_bundle: FluentBundle<FluentResource>,
+    i18n_bundle: &I18nBundle,
     _settings: config::Settings,
-) -> MenuState<'static> {
-    let mut menu = MenuBuilder::new().title(i18n_msg!(i18n_bundle, SpectatorsMenuTitle));
+) -> GeneralMenu<'static, MenuLevel> {
+    let mut menu = MenuBuilder::new(MenuLevel::SpectatorsMenu)
+        .title(i18n_msg!(i18n_bundle, SpectatorsMenuTitle));
     menu = menu
         .add_item(
             ListItem::new(Line::from(vec![
@@ -41,18 +40,19 @@ pub(super) fn build_spectators_menu(
         .add_item(item_text("🔁"), |_, _| None, ())
         .add_dummy_item();
 
-    let specs = {
-        let mut players = crate::love_players::get_players();
-        let mut skyapex_mod = lock_mod!();
-        players.retain(|target_ptr, _info| skyapex_mod.is_spec(*target_ptr));
-        players
-    };
+    // let specs = {
+    //     let mut players = crate::love_players::get_players();
+    //     let mut skyapex_mod = lock_mod!();
+    //     players.retain(|target_ptr, _info| skyapex_mod.is_spec(*target_ptr));
+    //     players
+    // };
+    let specs = crate::love_players::get_uid_players_map();
 
     let list = &lock_config!().hate_player;
-    for (_, spec) in specs {
+    for (uid, spec) in specs {
         let selected = list.iter().fold(false, |acc: bool, x: &LovePlayer| {
             if let Some(x_uid) = x.uid {
-                if x_uid == spec.uid {
+                if x_uid == uid {
                     return true;
                 }
             }

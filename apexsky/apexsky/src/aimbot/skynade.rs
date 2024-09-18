@@ -11,18 +11,18 @@ pub fn skynade_angle(
     local_view_origin: &[f32; 3],
     target: &[f32; 3],
 ) -> Option<(f32, f32)> {
-    const WEAP_ID_THERMITE_GRENADE: u32 = 174;
-    const WEAP_ID_FRAG_GRENADE: u32 = 175;
-    const WEAP_ID_ARC_STAR: u32 = 176;
+    const WEAP_ID_THERMITE_GRENADE: u32 = 177;
+    const WEAP_ID_FRAG_GRENADE: u32 = 178;
+    const WEAP_ID_ARC_STAR: u32 = 179;
 
     let (lob, pitches, z_offset): (bool, &[pitches::Pitch], f32) =
         match (weapon_mod_bitfield & 0x4 != 0, weapon_id) {
             (false, WEAP_ID_THERMITE_GRENADE) => (false, &pitches::GRENADE_PITCHES, 0.0),
             (false, WEAP_ID_FRAG_GRENADE) => (true, &pitches::GRENADE_PITCHES, 70.0),
-            (false, WEAP_ID_ARC_STAR) => (true, &pitches::ARC_PITCHES, 25.0),
+            (false, WEAP_ID_ARC_STAR) => (false, &pitches::ARC_PITCHES, 25.0),
             (true, WEAP_ID_THERMITE_GRENADE) => (false, &pitches::GRENADIER_GRENADE_PITCHES, 0.0),
             (true, WEAP_ID_FRAG_GRENADE) => (true, &pitches::GRENADIER_GRENADE_PITCHES, 70.0),
-            (true, WEAP_ID_ARC_STAR) => (true, &pitches::GRENADIER_ARC_PITCHES, 25.0),
+            (true, WEAP_ID_ARC_STAR) => (false, &pitches::GRENADIER_ARC_PITCHES, 25.0),
             _ => return Default::default(),
         };
     trace!(z_offset);

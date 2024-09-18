@@ -52,7 +52,7 @@ pub extern "C" fn save_settings() -> bool {
 
 #[no_mangle]
 pub extern "C" fn run_tui_menu() {
-    crate::menu::main().unwrap_or_else(|e| {
+    crate::menu::main(crate::menu::apex_menu::MenuLevel::MainMenu.into()).unwrap_or_else(|e| {
         println!("{}", e);
     });
 }
@@ -94,7 +94,7 @@ pub extern "C" fn print_run_as_root() {
 
 #[no_mangle]
 pub extern "C" fn kbd_backlight_blink(count: i32) -> bool {
-    if count < 1 || count > 10 || !lock_config!().settings.kbd_backlight_control {
+    if !(1..=10).contains(&count) || !lock_config!().settings.kbd_backlight_control {
         return false;
     }
     (|| -> anyhow::Result<()> {

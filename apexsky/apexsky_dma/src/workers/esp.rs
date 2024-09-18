@@ -1,9 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use apexsky::global_state::G_STATE;
 use apexsky_proto::pb::apexlegends::{
-    AimEntityData, AimTargetItem, AimTargetList, AimbotState, EspData, EspDataOption, EspSettings,
-    EspVisualsFlag, Loots, Matrix4x4, Players, SpectatorList,
+    AimEntityData, AimResultData, AimTargetHitbox, AimTargetItem, AimTargetList, AimbotState,
+    EspData, EspDataOption, EspSettings, EspVisualsFlag, GSettings, Loots, Matrix4x4, Players,
+    SpectatorList,
 };
 use apexsky_proto::pb::esp_service::esp_service_server::{EspService, EspServiceServer};
 use apexsky_proto::pb::esp_service::{
@@ -11,7 +12,6 @@ use apexsky_proto::pb::esp_service::{
 };
 use futures_util::FutureExt;
 use obfstr::obfstr as s;
-use parking_lot::RwLock;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::{sync::watch, time::sleep};
@@ -19,17 +19,12 @@ use tonic::codec::CompressionEncoding;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::instrument;
 
-use crate::game::player::GamePlayer;
-use crate::{SharedState, TaskChannels};
-
-#[derive(Debug)]
-pub struct MyEspService {
-    state: Arc<RwLock<SharedState>>,
-    channels: TaskChannels,
-}
+use crate::api_impl::GameApiHandle;
+use crate::game::data::ItemId;
+use crate::PRINT_LATENCY;
 
 #[tonic::async_trait]
-impl EspService for MyEspService {
+impl EspService for GameApiHandle {
     async fn unary_echo(
         &self,
         request: Request<EchoRequest>,
@@ -43,20 +38,18 @@ impl EspService for MyEspService {
 
     async fn get_players(
         &self,
-        request: Request<GetPlayersRequest>,
+        _request: Request<GetPlayersRequest>,
     ) -> Result<Response<Players>, Status> {
-        tracing::info!("Got a get_players request from {:?}", request.remote_addr());
         let reply = {
-            let lock = self.state.read();
+            let players = self.state.players.read().clone();
+            let data_timestamp = self.channels.update_time_rx.borrow().to_owned();
             Players {
                 version: 0,
-                players: lock
-                    .players
-                    .values()
-                    .map(GamePlayer::get_buf)
-                    .cloned()
+                players: players
+                    .into_iter()
+                    .map(|(_, pl)| pl.get_buf().clone())
                     .collect(),
-                data_timestamp: lock.update_time,
+                data_timestamp,
             }
         };
         Ok(Response::new(reply))
@@ -66,39 +59,30 @@ impl EspService for MyEspService {
         &self,
         request: Request<GetLootsRequest>,
     ) -> Result<Response<Loots>, Status> {
-        tracing::info!("Got a get_loots request from {:?}", request.remote_addr());
         let req = request.into_inner();
         let filter_dist = req.max_distance > 0.0;
         let filter_id = !req.wish_list.is_empty();
         let reply = {
-            let lock = self.state.read();
+            let treasure_clues = self.state.treasure_clues.read().clone().into_values();
+            let data_timestamp = self.channels.update_time_rx.borrow().to_owned();
             Loots {
                 version: 0,
                 loots: match (filter_dist, filter_id) {
-                    (true, true) => lock
-                        .treasure_clues
-                        .iter()
+                    (true, true) => treasure_clues
                         .filter(|clue| {
                             clue.distance <= req.max_distance
                                 && req.wish_list.contains(&clue.item_id)
                         })
-                        .cloned()
                         .collect(),
-                    (true, false) => lock
-                        .treasure_clues
-                        .iter()
+                    (true, false) => treasure_clues
                         .filter(|clue| clue.distance <= req.max_distance)
-                        .cloned()
                         .collect(),
-                    (false, true) => lock
-                        .treasure_clues
-                        .iter()
+                    (false, true) => treasure_clues
                         .filter(|clue| req.wish_list.contains(&clue.item_id))
-                        .cloned()
                         .collect(),
-                    (false, false) => lock.treasure_clues.clone(),
+                    (false, false) => treasure_clues.collect(),
                 },
-                data_timestamp: lock.update_time,
+                data_timestamp,
             }
         };
         Ok(Response::new(reply))
@@ -110,8 +94,43 @@ impl EspService for MyEspService {
     ) -> Result<Response<EspData>, Status> {
         let op = request.into_inner();
 
+        let update_time = {
+            let mut rx = self.channels.update_time_rx.clone();
+            if op.sync {
+                if let Err(e) = rx.changed().await {
+                    tracing::error!(%e, ?e);
+                }
+            }
+            let x = rx.borrow().to_owned();
+            x
+        };
+
         let reply = {
-            let lock = self.state.read();
+            let state = &self.state;
+            let aim_entities = state.aim_entities.read().clone();
+            let aim_target = state.aim_target.lock().clone();
+            let aimbot_state = state.aimbot_state.lock().clone();
+            let game_fps = state.game_fps.lock().to_owned();
+            let players = state.players.read().clone();
+            let spectators = state.spectator_list.lock().clone();
+            let teammates = state.teammates.lock().clone();
+            let view_matrix = state.view_matrix.lock().to_vec();
+
+            if PRINT_LATENCY {
+                println!(
+                    "{}{:.1}",
+                    s!("esp_service data latency "),
+                    apexsky::aimbot::get_unix_timestamp_in_millis() as f64 - update_time * 1000.0
+                );
+            }
+
+            let (allied_spectator_list, spectator_list) = spectators;
+            let local_player = state
+                .get_local_player_ptr()
+                .and_then(|ptr| players.get(&ptr));
+            let view_player = state
+                .get_view_player_ptr()
+                .and_then(|ptr| players.get(&ptr));
 
             let aim_targets: Vec<AimTargetItem> = self
                 .channels
@@ -119,7 +138,7 @@ impl EspService for MyEspService {
                 .borrow()
                 .iter()
                 .filter_map(|target_info| {
-                    let Some(entity) = lock.aim_entities.get(&target_info.entity_ptr) else {
+                    let Some(entity) = aim_entities.get(&target_info.entity_ptr) else {
                         return None;
                     };
                     Some(AimTargetItem {
@@ -148,48 +167,85 @@ impl EspService for MyEspService {
                         player_data: if target_info.is_npc {
                             None
                         } else {
-                            lock.players
+                            players
                                 .get(&target_info.entity_ptr)
-                                .map(|pl| pl.get_buf())
-                                .cloned()
+                                .map(|pl| pl.get_buf().clone())
+                        },
+                        hitboxes: if entity.is_visible() || target_info.distance < 40.0 * 5.0 {
+                            entity
+                                .get_bones_data()
+                                .into_iter()
+                                .map(|hb| AimTargetHitbox {
+                                    bone: hb.bone,
+                                    group: hb.group,
+                                    bbmin: Some(hb.bbmin.into()),
+                                    bbmax: Some(hb.bbmax.into()),
+                                    bone_origin: Some(hb.bone_origin.into()),
+                                    bone_parent: hb.bone_parent,
+                                    radius: hb.radius,
+                                })
+                                .collect()
+                        } else {
+                            vec![]
                         },
                     })
                 })
                 .collect();
 
             EspData {
-                ready: lock.game_baseaddr.is_some(),
-                in_game: lock.world_ready,
-                tick_num: lock.tick_num,
-                frame_count: lock.frame_count.try_into().unwrap(),
-                view_matrix: Some(Matrix4x4 {
-                    elements: lock.view_matrix.to_vec(),
-                }),
-                view_player: lock.view_player.as_ref().map(GamePlayer::get_buf).cloned(),
-                local_player: lock.local_player.as_ref().map(GamePlayer::get_buf).cloned(),
-                aimbot: lock
-                    .aimbot_state
-                    .as_ref()
-                    .map(|(state, duration)| AimbotState {
-                        version: 0,
-                        serialized_data: if op.full_aimbot_state {
-                            serde_json::to_string(state).ok()
-                        } else {
-                            None
-                        },
-                        loop_duration: duration.as_millis().try_into().unwrap(),
-                        target_position: Some(lock.aim_target.into()),
-                        aim_mode: state.get_settings().aim_mode,
-                        aiming: state.is_aiming(),
-                        gun_safety: state.get_gun_safety(),
-                        target_locked: state.is_locked(),
-                        aim_key_state: state.get_aim_key_state(),
-                        held_id: state.get_held_id(),
-                        held_grenade: state.is_grenade(),
-                        weapon_id: state.get_weapon_id(),
-                        max_fov: state.get_max_fov(),
-                        aim_entity: state.get_aim_entity(),
+                ready: state.get_game_baseaddr().is_some(),
+                in_game: state.is_world_ready(),
+                tick_num: state.tick_num.load(std::sync::atomic::Ordering::Acquire),
+                frame_count: state
+                    .frame_count
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    .try_into()
+                    .unwrap_or_else(|e| {
+                        let v = state.frame_count.load(std::sync::atomic::Ordering::Acquire);
+                        tracing::debug!(?e, ?v);
+                        0
                     }),
+                view_matrix: Some(Matrix4x4 {
+                    elements: view_matrix,
+                }),
+                view_player: view_player.map(|pl| pl.get_buf()).cloned(),
+                local_player: local_player.map(|pl| pl.get_buf()).cloned(),
+                aimbot: aimbot_state.as_ref().map(|(state, duration)| AimbotState {
+                    version: 0,
+                    serialized_data: if op.full_aimbot_state {
+                        serde_json::to_string(state).ok()
+                    } else {
+                        None
+                    },
+                    loop_duration: duration.as_millis().try_into().unwrap(),
+                    target_position: aim_target.2.map(Into::into),
+                    aim_mode: state.get_settings().aim_mode,
+                    aiming: state.is_aiming(),
+                    gun_safety: state.get_gun_safety(),
+                    target_locked: state.is_locked(),
+                    aim_key_state: state.get_aim_key_state(),
+                    held_id: state.get_held_id(),
+                    held_grenade: state.is_grenade(),
+                    weapon_id: state.get_weapon_id(),
+                    max_fov: state.get_max_fov(),
+                    aim_entity: state.get_aim_entity(),
+                    aim_result: aim_target.0.valid.then_some(AimResultData {
+                        hitscan: aim_target.0.hitscan,
+                        view_pitch: aim_target.0.view_pitch,
+                        view_yaw: aim_target.0.view_yaw,
+                        delta_pitch: aim_target.0.delta_pitch,
+                        delta_yaw: aim_target.0.delta_yaw,
+                        delta_pitch_min: aim_target.0.delta_pitch_min,
+                        delta_pitch_max: aim_target.0.delta_pitch_max,
+                        delta_yaw_min: aim_target.0.delta_yaw_min,
+                        delta_yaw_max: aim_target.0.delta_yaw_max,
+                        distance: aim_target.0.distance,
+                        hitscan_nearest_pos: aim_target
+                            .1
+                            .and_then(|v| v.nearest_bone_pos)
+                            .map(Into::into),
+                    }),
+                }),
                 target_count: aim_targets.len() as u64,
                 targets: Some(AimTargetList {
                     version: 0,
@@ -197,28 +253,26 @@ impl EspService for MyEspService {
                 }),
                 teammates: Some(Players {
                     version: 0,
-                    players: lock.teammates.clone(),
-                    data_timestamp: lock.update_time,
+                    players: teammates,
+                    data_timestamp: update_time,
                 }),
                 spectators: Some(SpectatorList {
-                    elements: [
-                        lock.spectator_list.clone(),
-                        lock.allied_spectator_list.clone(),
-                    ]
-                    .concat(),
+                    elements: [spectator_list, allied_spectator_list].concat(),
                 }),
-                duration_tick: lock.update_duration.1.try_into().unwrap(),
-                duration_actions: lock.update_duration.0.try_into().unwrap(),
-                data_timestamp: lock.update_time,
-                game_fps: lock.game_fps,
+                duration_tick: state
+                    .tick_duration
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                duration_actions: state
+                    .actions_duration
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                data_timestamp: update_time,
+                game_fps: game_fps,
                 current_zoom_fov: {
-                    lock.aimbot_state
-                        .as_ref()
+                    aimbot_state
                         .is_some_and(|(aimbot, _)| aimbot.get_zoom_state() > 0)
                         .then(|| {
-                            lock.view_player
-                                .as_ref()
-                                .and_then(GamePlayer::get_active_weapon)
+                            view_player
+                                .and_then(|pl| pl.get_active_weapon())
                                 .map(|weapon| {
                                     let zoom_fov = weapon.cur_zoom_fov;
                                     if zoom_fov.is_normal() && (zoom_fov - 1.0).abs() > f32::EPSILON
@@ -242,7 +296,7 @@ impl EspService for MyEspService {
         _request: Request<()>,
     ) -> Result<Response<EspSettings>, Status> {
         let reply = {
-            let g_settings = &G_STATE.lock().unwrap().config.settings;
+            let g_settings = G_STATE.lock().unwrap().config.settings.clone();
             EspSettings {
                 esp: if g_settings.no_overlay { 0 } else { 1 },
                 screen_width: g_settings.screen_width,
@@ -251,7 +305,11 @@ impl EspService for MyEspService {
                 debug_mode: g_settings.debug_mode,
                 esp_visuals: {
                     let v = &g_settings.esp_visuals;
-                    (if v.r#box {
+                    (if v.bone {
+                        EspVisualsFlag::Bone.into()
+                    } else {
+                        0
+                    }) + (if v.r#box {
                         EspVisualsFlag::Box.into()
                     } else {
                         0
@@ -298,6 +356,36 @@ impl EspService for MyEspService {
                     ]
                     .into(),
                 ),
+                desired_loots: vec![
+                    ItemId::ApexskyItemDeathBox.0,
+                    ItemId::ShieldBatteryLarge.0,
+                    ItemId::ShieldUpgradeHead3.0,
+                    ItemId::ShieldUpgradeHead4.0,
+                    ItemId::ShieldDown4.0,
+                    ItemId::HeavyBackpack.0,
+                    ItemId::GoldBackpack.0,
+                    ItemId::LightAmmoMag3.0,
+                    ItemId::LightAmmoMag4.0,
+                    ItemId::HeavyAmmoMag4.0,
+                    ItemId::EnergyAmmoMag3.0,
+                    ItemId::EnergyAmmoMag4.0,
+                    ItemId::StockRegular3.0,
+                    ItemId::TurboCharger.0,
+                ],
+            }
+        };
+        Ok(Response::new(reply))
+    }
+
+    async fn get_global_settings(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<GSettings>, Status> {
+        let reply = {
+            let g_settings = G_STATE.lock().unwrap().config.settings.clone();
+            GSettings {
+                ver_stamp: 0,
+                serialized_data: serde_json::to_string(&g_settings).ok(),
             }
         };
         Ok(Response::new(reply))
@@ -307,8 +395,7 @@ impl EspService for MyEspService {
 #[instrument(skip_all)]
 pub async fn esp_loop(
     mut active: watch::Receiver<bool>,
-    state: Arc<RwLock<SharedState>>,
-    channels: TaskChannels,
+    game_api: GameApiHandle,
 ) -> anyhow::Result<()> {
     tracing::debug!("{}", s!("task start"));
 
@@ -369,14 +456,11 @@ pub async fn esp_loop(
             } else {
                 // Start server
                 let config = G_STATE.lock().unwrap().config.esp_service.clone();
-                let service = EspServiceServer::new(MyEspService {
-                    state: state.clone(),
-                    channels: channels.clone(),
-                })
-                .accept_compressed(CompressionEncoding::Zstd)
-                .accept_compressed(CompressionEncoding::Gzip)
-                .send_compressed(CompressionEncoding::Zstd)
-                .send_compressed(CompressionEncoding::Gzip);
+                let service = EspServiceServer::new(game_api.clone())
+                    .accept_compressed(CompressionEncoding::Zstd)
+                    .accept_compressed(CompressionEncoding::Gzip)
+                    .send_compressed(CompressionEncoding::Zstd)
+                    .send_compressed(CompressionEncoding::Gzip);
                 let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
                 let task = tokio::spawn(
                     Server::builder()

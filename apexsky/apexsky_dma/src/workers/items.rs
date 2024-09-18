@@ -1,20 +1,20 @@
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use apexsky::{config::Settings, global_state::G_STATE};
 use apexsky_proto::pb::apexlegends::TreasureClue;
 use obfstr::obfstr as s;
-use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::{sleep_until, Instant};
 use tracing::instrument;
 
 use crate::game::data::*;
-use crate::SharedState;
+use crate::SharedStateWrapper;
 
 #[instrument]
 pub async fn items_loop(
     mut active: watch::Receiver<bool>,
-    shared_state: Arc<RwLock<SharedState>>,
+    shared_state: SharedStateWrapper,
     items_glow_tx: watch::Sender<Vec<(u64, u8)>>,
 ) -> anyhow::Result<()> {
     let mut start_instant = Instant::now();
@@ -26,22 +26,18 @@ pub async fn items_loop(
         sleep_until(start_instant).await;
         start_instant = Instant::now();
 
-        {
-            let state = shared_state.read();
-            if state.game_baseaddr.is_none() || !state.world_ready {
-                tracing::trace!("{}", s!("waiting for world ready"));
-                continue;
-            }
+        if shared_state.get_game_baseaddr().is_none() || !shared_state.is_world_ready() {
+            tracing::trace!("{}", s!("waiting for world ready"));
+            continue;
         }
 
         let g_settings = G_STATE.lock().unwrap().config.settings.clone();
+        let treasure_clues = shared_state.treasure_clues.read().clone();
 
-        let item_glow = shared_state
-            .read()
-            .treasure_clues
-            .iter()
+        let item_glow = treasure_clues
+            .into_values()
             .filter_map(|clue| {
-                process_loot(clue, &g_settings).map(|glow_ctx| (clue.entity_handle, glow_ctx))
+                process_loot(&clue, &g_settings).map(|glow_ctx| (clue.entity_handle, glow_ctx))
             })
             .collect();
 
@@ -61,22 +57,16 @@ fn process_loot(clue: &TreasureClue, g_settings: &Settings) -> Option<u8> {
         return None;
     }
 
-    let item_id = ItemId::try_from(clue.custom_item_id).unwrap_or_else(|_e| {
-        //tracing::warn!(?clue, "{}", s!("unknown item id"));
-        ItemId::Unknown
-    });
-
-    if !g_settings.item_glow {
-        return None;
-    }
-
     if clue.distance > g_settings.aimbot_settings.aim_dist {
         return None;
     }
 
     let select = &g_settings.loot;
 
-    match item_id {
+    match ItemId(clue.item_id) {
+        // DeathBox
+        ItemId::ApexskyItemDeathBox if g_settings.deathbox => Some(HIGHLIGHT_DEATH_BOX),
+
         // Backpacks
         ItemId::LightBackpack if select.lightbackpack => Some(HIGHLIGHT_LOOT_WHITE),
         ItemId::MedBackpack if select.medbackpack => Some(HIGHLIGHT_LOOT_BLUE),
@@ -84,25 +74,10 @@ fn process_loot(clue: &TreasureClue, g_settings: &Settings) -> Option<u8> {
         ItemId::GoldBackpack if select.goldbackpack => Some(HIGHLIGHT_LOOT_GOLD),
 
         // Shields
-        ItemId::ShieldUpgrade1_0 | ItemId::ShieldUpgrade1_1 if select.shieldupgrade1 => {
-            Some(HIGHLIGHT_LOOT_WHITE)
-        }
-        ItemId::ShieldUpgrade2_0 | ItemId::ShieldUpgrade2_1 | ItemId::ArmorCore1
-            if select.shieldupgrade2 =>
-        {
-            Some(HIGHLIGHT_LOOT_BLUE)
-        }
-        ItemId::ShieldUpgrade3_0 | ItemId::ShieldUpgrade3_1 | ItemId::ArmorCore2
-            if select.shieldupgrade3 =>
-        {
-            Some(HIGHLIGHT_LOOT_PURPLE)
-        }
-        ItemId::ShieldUpgrade4 | ItemId::ArmorCore3 if select.shieldupgrade4 => {
-            Some(HIGHLIGHT_LOOT_GOLD)
-        }
-        ItemId::ShieldUpgrade5 | ItemId::ArmorCore4 if select.shieldupgrade5 => {
-            Some(HIGHLIGHT_LOOT_RED)
-        }
+        ItemId::ArmorCore1 if select.shieldupgrade1 => Some(HIGHLIGHT_LOOT_WHITE),
+        ItemId::ArmorCore2 if select.shieldupgrade2 => Some(HIGHLIGHT_LOOT_BLUE),
+        ItemId::ArmorCore3 if select.shieldupgrade3 => Some(HIGHLIGHT_LOOT_PURPLE),
+        ItemId::ArmorCore4 if select.shieldupgrade5 => Some(HIGHLIGHT_LOOT_RED),
         ItemId::ShieldUpgradeHead1 if select.shieldupgradehead1 => Some(HIGHLIGHT_LOOT_WHITE),
         ItemId::ShieldUpgradeHead2 if select.shieldupgradehead2 => Some(HIGHLIGHT_LOOT_BLUE),
         ItemId::ShieldUpgradeHead3 if select.shieldupgradehead3 => Some(HIGHLIGHT_LOOT_PURPLE),
@@ -222,4 +197,41 @@ fn process_loot(clue: &TreasureClue, g_settings: &Settings) -> Option<u8> {
 
         _ => None,
     }
+}
+
+#[derive(Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub(crate) struct LootInt {
+    pub(crate) int: i32,
+    pub(crate) model: String,
+}
+
+pub fn export_new_items(loots: Vec<LootInt>) -> anyhow::Result<()> {
+    use std::fs;
+    use std::io::Write;
+
+    let mut modify = false;
+    for item in &loots {
+        let Some(model) = ITEM_LIST.get(&item.int) else {
+            modify = true;
+            tracing::info!(?item, "{}", s!("new loot item"));
+            continue;
+        };
+        if *model != item.model {
+            modify = true;
+            //tracing::info!(?item, "{}", s!("loot model changed"));
+        }
+    }
+
+    if modify {
+        let items_json = serde_json::to_string(&loots)?;
+        let path = std::env::current_dir()?.join(s!("updated_item.json"));
+        let mut json_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
+        write!(json_file, "{}", items_json)?;
+    }
+
+    Ok(())
 }

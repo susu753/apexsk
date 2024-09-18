@@ -1,5 +1,7 @@
-use apexsky::aimbot::AimEntity;
-use apexsky_proto::pb::apexlegends::{Badge, GradeFlag, PlayerState};
+use std::vec;
+
+use apexsky::aimbot::{get_unix_timestamp_in_millis, AimEntity, HitboxData};
+use apexsky_proto::pb::apexlegends::{Badge, GradeFlag, PlayerState, TreasureClue};
 use obfstr::obfstr as s;
 
 use crate::apexdream::sdk::ScriptNetVarName;
@@ -131,24 +133,6 @@ impl GamePlayer {
         }
     }
 
-    pub fn update_buf_hotdata(&mut self, value: &PlayerEntity) {
-        let state = value;
-
-        let buf = &mut self.buf;
-        buf.origin = Some(state.origin.into());
-        buf.view_angles = Some(state.view_angles.into());
-        buf.velocity = Some(state.velocity.into());
-        buf.yaw = state.yaw;
-        buf.health = state.health;
-        buf.shield = state.shields;
-        buf.flags = state.flags as i32;
-        buf.is_alive = state.is_alive();
-        buf.is_knocked = state.is_knocked();
-        buf.head_position = Some(state.get_bone_position_by_hitbox(0).into());
-
-        self.state = state.clone();
-    }
-
     pub fn get_buf(&self) -> &PlayerState {
         &self.buf
     }
@@ -212,6 +196,74 @@ impl apexsky::aimbot::AimEntity for PlayerEntity {
         }
     }
 
+    #[tracing::instrument]
+    fn get_hitbox(&self) -> Vec<([f32; 3], ([f32; 3], [f32; 3]))> {
+        self.studio
+            .hitboxes
+            .iter()
+            .filter_map(|bbox| {
+                self.bones.v.get(bbox.bone as usize).and_then(|matrix| {
+                    Some(([matrix[3], matrix[7], matrix[11]], (bbox.bbmin, bbox.bbmax)))
+                })
+            })
+            .collect()
+    }
+
+    #[tracing::instrument]
+    fn get_bones_data(&self) -> Vec<HitboxData> {
+        // self.studio
+        //     .hitboxes
+        //     .iter()
+        //     .filter_map(|bbox| {
+        //         self.bones.v.get(bbox.bone as usize).and_then(|matrix| {
+        //             Some(HitboxData {
+        //                 bone: bbox.bone as i32,
+        //                 group: bbox.group as i32,
+        //                 bbmin: bbox.bbmin,
+        //                 bbmax: bbox.bbmax,
+        //                 bone_origin: [matrix[3], matrix[7], matrix[11]],
+        //                 bone_parent: self.studio.bones.get(bbox.bone as usize)?.parent as i32 - 1,
+        //                 radius: bbox.radius(),
+        //             })
+        //         })
+        //     })
+        //     .collect()
+        self.studio
+            .bones
+            .iter()
+            .enumerate()
+            .filter_map(|(bone, bbone)| {
+                let matrix = self.bones.v.get(bone)?;
+                if let Some(bbox) = self
+                    .studio
+                    .hb_lookup
+                    .get(bone)
+                    .and_then(|&hitbox_idx| self.studio.hitboxes.get(hitbox_idx as usize))
+                {
+                    Some(HitboxData {
+                        bone: bone.try_into().unwrap(),
+                        group: bbox.group as i32,
+                        bbmin: bbox.bbmin,
+                        bbmax: bbox.bbmax,
+                        bone_origin: [matrix[3], matrix[7], matrix[11]],
+                        bone_parent: bbone.parent as i32 - 1,
+                        radius: bbox.radius(),
+                    })
+                } else {
+                    Some(HitboxData {
+                        bone: bone.try_into().unwrap(),
+                        group: sdk::HITGROUP_GENERIC as i32,
+                        bbmin: [0.0, 0.0, 0.0],
+                        bbmax: [0.0, 0.0, 0.0],
+                        bone_origin: [matrix[3], matrix[7], matrix[11]],
+                        bone_parent: bbone.parent as i32 - 1,
+                        radius: 0.0,
+                    })
+                }
+            })
+            .collect()
+    }
+
     fn get_position(&self) -> [f32; 3] {
         self.origin
     }
@@ -264,6 +316,14 @@ impl apexsky::aimbot::AimEntity for PlayerEntity {
         self.max_shields.max(self.get_shield_health())
     }
 
+    fn get_visible_duration(&self) -> f64 {
+        if self.is_visible {
+            get_unix_timestamp_in_millis() as f64 / 1000.0 - self.visible_time
+        } else {
+            0.0
+        }
+    }
+
     fn is_alive(&self) -> bool {
         self.is_alive()
     }
@@ -278,6 +338,10 @@ impl apexsky::aimbot::AimEntity for PlayerEntity {
 
     fn is_visible(&self) -> bool {
         self.is_visible
+    }
+
+    fn is_loot(&self) -> bool {
+        false
     }
 }
 
@@ -322,6 +386,57 @@ impl apexsky::aimbot::AimEntity for BaseNPCEntity {
         }
     }
 
+    #[tracing::instrument]
+    fn get_hitbox(&self) -> Vec<([f32; 3], ([f32; 3], [f32; 3]))> {
+        self.studio
+            .hitboxes
+            .iter()
+            .filter_map(|bbox| {
+                self.bones.v.get(bbox.bone as usize).and_then(|matrix| {
+                    Some(([matrix[3], matrix[7], matrix[11]], (bbox.bbmin, bbox.bbmax)))
+                })
+            })
+            .collect()
+    }
+
+    #[tracing::instrument]
+    fn get_bones_data(&self) -> Vec<HitboxData> {
+        self.studio
+            .bones
+            .iter()
+            .enumerate()
+            .filter_map(|(bone, bbone)| {
+                let matrix = self.bones.v.get(bone)?;
+                if let Some(bbox) = self
+                    .studio
+                    .hb_lookup
+                    .get(bone)
+                    .and_then(|&hitbox_idx| self.studio.hitboxes.get(hitbox_idx as usize))
+                {
+                    Some(HitboxData {
+                        bone: bone.try_into().unwrap(),
+                        group: bbox.group as i32,
+                        bbmin: bbox.bbmin,
+                        bbmax: bbox.bbmax,
+                        bone_origin: [matrix[3], matrix[7], matrix[11]],
+                        bone_parent: bbone.parent as i32 - 1,
+                        radius: bbox.radius(),
+                    })
+                } else {
+                    Some(HitboxData {
+                        bone: bone.try_into().unwrap(),
+                        group: sdk::HITGROUP_GENERIC as i32,
+                        bbmin: [0.0, 0.0, 0.0],
+                        bbmax: [0.0, 0.0, 0.0],
+                        bone_origin: [matrix[3], matrix[7], matrix[11]],
+                        bone_parent: bbone.parent as i32 - 1,
+                        radius: 0.0,
+                    })
+                }
+            })
+            .collect()
+    }
+
     fn get_position(&self) -> [f32; 3] {
         self.origin
     }
@@ -354,6 +469,14 @@ impl apexsky::aimbot::AimEntity for BaseNPCEntity {
         self.max_shields
     }
 
+    fn get_visible_duration(&self) -> f64 {
+        if self.is_visible {
+            get_unix_timestamp_in_millis() as f64 / 1000.0 - self.visible_time
+        } else {
+            0.0
+        }
+    }
+
     fn is_alive(&self) -> bool {
         self.is_alive() && self.get_health() > 0
     }
@@ -368,5 +491,204 @@ impl apexsky::aimbot::AimEntity for BaseNPCEntity {
 
     fn is_visible(&self) -> bool {
         self.is_visible
+    }
+
+    fn is_loot(&self) -> bool {
+        false
+    }
+}
+
+impl AimEntity for GamePlayer {
+    fn get_entity_ptr(&self) -> u64 {
+        self.get_entity().get_entity_ptr()
+    }
+
+    fn get_view_angles(&self) -> [f32; 3] {
+        self.get_entity().get_view_angles()
+    }
+
+    fn get_cam_pos(&self) -> [f32; 3] {
+        self.get_entity().get_cam_pos()
+    }
+
+    fn get_sway_angles(&self) -> [f32; 3] {
+        self.get_entity().get_sway_angles()
+    }
+
+    fn get_abs_velocity(&self) -> [f32; 3] {
+        self.get_entity().get_abs_velocity()
+    }
+
+    fn get_bone_position_by_hitbox(&self, id: u32) -> [f32; 3] {
+        self.get_entity().get_bone_position_by_hitbox(id)
+    }
+
+    fn get_bones_data(&self) -> Vec<HitboxData> {
+        self.get_entity().get_bones_data()
+    }
+
+    fn get_hitbox(&self) -> Vec<([f32; 3], ([f32; 3], [f32; 3]))> {
+        self.get_entity().get_hitbox()
+    }
+
+    fn get_position(&self) -> [f32; 3] {
+        self.get_entity().get_position()
+    }
+
+    fn get_recoil_angles(&self) -> [f32; 3] {
+        self.get_entity().get_recoil_angles()
+    }
+
+    fn get_view_offset(&self) -> [f32; 3] {
+        self.get_entity().get_view_offset()
+    }
+
+    fn get_team_num(&self) -> i32 {
+        self.get_entity().get_team_num()
+    }
+
+    fn get_health(&self) -> i32 {
+        self.get_entity().get_health()
+    }
+
+    fn get_shield_health(&self) -> i32 {
+        self.get_entity().get_shield_health()
+    }
+
+    fn get_max_health(&self) -> i32 {
+        self.get_entity().get_max_health()
+    }
+
+    fn get_max_shield_health(&self) -> i32 {
+        self.get_entity().get_max_shield_health()
+    }
+
+    fn get_visible_duration(&self) -> f64 {
+        self.get_entity().get_visible_duration()
+    }
+
+    fn is_alive(&self) -> bool {
+        self.get_entity().is_alive()
+    }
+
+    fn is_knocked(&self) -> bool {
+        self.get_entity().is_knocked()
+    }
+
+    fn is_player(&self) -> bool {
+        self.get_entity().is_player()
+    }
+
+    fn is_visible(&self) -> bool {
+        self.get_entity().is_visible()
+    }
+
+    fn is_loot(&self) -> bool {
+        self.get_entity().is_loot()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QuickLooting(pub TreasureClue);
+
+impl AimEntity for QuickLooting {
+    fn get_entity_ptr(&self) -> u64 {
+        self.0.entity_handle
+    }
+
+    fn get_view_angles(&self) -> [f32; 3] {
+        Default::default()
+    }
+
+    fn get_cam_pos(&self) -> [f32; 3] {
+        self.get_position()
+    }
+
+    fn get_sway_angles(&self) -> [f32; 3] {
+        Default::default()
+    }
+
+    fn get_abs_velocity(&self) -> [f32; 3] {
+        Default::default()
+    }
+
+    fn get_bone_position_by_hitbox(&self, _id: u32) -> [f32; 3] {
+        self.get_position()
+    }
+
+    fn get_bones_data(&self) -> Vec<HitboxData> {
+        vec![HitboxData {
+            bone: 0,
+            group: 0,
+            bbmin: [-6.0, -6.0, -6.0],
+            bbmax: [6.0, 6.0, 6.0],
+            bone_origin: [0.0, 0.0, 0.0],
+            bone_parent: 0,
+            radius: f32::sqrt(6.0 * 6.0 * 3.0),
+        }]
+    }
+
+    fn get_hitbox(&self) -> Vec<([f32; 3], ([f32; 3], [f32; 3]))> {
+        vec![([0.0, 0.0, 0.0], ([-6.0, -6.0, -6.0], [6.0, 6.0, 6.0]))]
+    }
+
+    fn get_position(&self) -> [f32; 3] {
+        self.0
+            .position
+            .clone()
+            .map(|pos| pos.into())
+            .unwrap_or_default()
+    }
+
+    fn get_recoil_angles(&self) -> [f32; 3] {
+        Default::default()
+    }
+
+    fn get_view_offset(&self) -> [f32; 3] {
+        Default::default()
+    }
+
+    fn get_team_num(&self) -> i32 {
+        Default::default()
+    }
+
+    fn get_health(&self) -> i32 {
+        Default::default()
+    }
+
+    fn get_shield_health(&self) -> i32 {
+        Default::default()
+    }
+
+    fn get_max_health(&self) -> i32 {
+        Default::default()
+    }
+
+    fn get_max_shield_health(&self) -> i32 {
+        Default::default()
+    }
+
+    fn get_visible_duration(&self) -> f64 {
+        200.0
+    }
+
+    fn is_alive(&self) -> bool {
+        true
+    }
+
+    fn is_knocked(&self) -> bool {
+        false
+    }
+
+    fn is_player(&self) -> bool {
+        false
+    }
+
+    fn is_visible(&self) -> bool {
+        true
+    }
+
+    fn is_loot(&self) -> bool {
+        true
     }
 }

@@ -1,9 +1,10 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64};
 use std::sync::Arc;
 use std::time::Duration;
 
 use apexsky::__load_settings;
-use apexsky::aimbot::{AimEntity, Aimbot};
+use apexsky::aimbot::{AimAngles, AimEntity, Aimbot, HitScanReport};
 use apexsky::config::Settings;
 use apexsky::global_state::G_STATE;
 use apexsky_dmalib::MemConnector;
@@ -11,7 +12,8 @@ use apexsky_proto::pb::apexlegends::{
     AimKeyState, AimTargetInfo, PlayerState, SpectatorInfo, TreasureClue,
 };
 use obfstr::obfstr as s;
-use parking_lot::RwLock;
+use once_cell::sync::Lazy;
+use parking_lot::{Mutex, RwLock};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{self, JoinHandle};
 use tokio::time::sleep;
@@ -20,6 +22,7 @@ use tracing_appender::non_blocking::NonBlocking;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::EnvFilter;
+use usermod_thr::UserModEvent;
 
 use crate::game::player::GamePlayer;
 
@@ -27,39 +30,49 @@ pub use apexsky::noobfstr;
 
 mod actuator;
 mod apexdream;
+mod api_impl;
 mod context_impl;
 mod game;
+mod menu;
+mod usermod_thr;
 mod workers;
 
-#[derive(Debug, Default, Clone)]
+const PRINT_LATENCY: bool = false;
+
+pub(crate) static USERMOD_TX: Lazy<RwLock<Option<mpsc::UnboundedSender<UserModEvent>>>> =
+    Lazy::new(|| RwLock::new(None));
+
+#[derive(Debug, Default)]
 struct SharedState {
-    game_baseaddr: Option<u64>,
-    tick_num: u64,
-    update_time: f64,
-    update_duration: (u128, u128),
-    aim_target: [f32; 3],
-    view_matrix: [f32; 16],
-    highlight_injected: bool,
-    treasure_clues: Vec<TreasureClue>,
-    teammates: Vec<PlayerState>,
-    spectator_list: Vec<SpectatorInfo>,
-    allied_spectator_list: Vec<SpectatorInfo>,
-    map_testing_local_team: i32,
-    world_ready: bool,
-    frame_count: i32,
-    game_fps: f32,
-    players: HashMap<u64, GamePlayer>,
-    aim_entities: HashMap<u64, Arc<dyn AimEntity>>,
-    local_player: Option<GamePlayer>,
-    view_player: Option<GamePlayer>,
-    aimbot_state: Option<(Aimbot, Duration)>,
+    game_baseaddr: AtomicU64,
+    tick_num: AtomicU64,
+    tick_duration: AtomicU64,
+    actions_duration: AtomicU64,
+    aim_target: Mutex<(AimAngles, Option<HitScanReport>, Option<[f32; 3]>)>,
+    view_matrix: Mutex<[f32; 16]>,
+    highlight_injected: AtomicBool,
+    teammates: Mutex<Vec<PlayerState>>,
+    spectator_list: Mutex<(Vec<SpectatorInfo>, Vec<SpectatorInfo>)>,
+    map_testing_local_team: AtomicI32,
+    world_ready: AtomicBool,
+    frame_count: AtomicI32,
+    game_fps: Mutex<f32>,
+    players: RwLock<HashMap<u64, Arc<GamePlayer>>>,
+    npcs: RwLock<HashMap<u64, Arc<dyn AimEntity>>>,
+    treasure_clues: RwLock<HashMap<u64, TreasureClue>>,
+    aim_entities: RwLock<HashMap<u64, Arc<dyn AimEntity>>>,
+    local_player_ptr: AtomicU64,
+    view_player_ptr: AtomicU64,
+    aimbot_state: Mutex<Option<(Aimbot, Duration)>>,
 }
+
+pub(crate) type SharedStateWrapper = Arc<SharedState>;
 
 #[derive(Debug)]
 struct State {
     active: bool,
     active_tx: watch::Sender<bool>,
-    shared_state: Arc<RwLock<SharedState>>,
+    shared_state: SharedStateWrapper,
     io_thread: Option<std::thread::JoinHandle<anyhow::Result<()>>>,
     actions_t: Option<JoinHandle<anyhow::Result<()>>>,
     aim_t: Option<JoinHandle<anyhow::Result<()>>>,
@@ -67,6 +80,7 @@ struct State {
     esp_t: Option<JoinHandle<anyhow::Result<()>>>,
     items_t: Option<JoinHandle<anyhow::Result<()>>>,
     terminal_task: Option<JoinHandle<()>>,
+    usermod_t: Option<JoinHandle<anyhow::Result<()>>>,
 }
 
 impl State {
@@ -76,7 +90,7 @@ impl State {
         Self {
             active,
             active_tx,
-            shared_state: Arc::new(RwLock::new(SharedState::default())),
+            shared_state: Arc::new(SharedState::default()),
             io_thread: None,
             actions_t: None,
             aim_t: None,
@@ -84,6 +98,7 @@ impl State {
             esp_t: None,
             items_t: None,
             terminal_task: None,
+            usermod_t: None,
         }
     }
 
@@ -103,7 +118,7 @@ impl State {
         if active {
             if self.terminal_task.is_none() {
                 let tui_task = task::spawn_blocking(|| {
-                    apexsky::menu::main()
+                    apexsky::menu::main(menu::CustomMenuLevel::ApexskyMenu.into())
                         .unwrap_or_else(|e| tracing::error!(%e, ?e, "{}", s!("menu::main()")))
                 });
                 self.terminal_task = Some(tui_task);
@@ -120,10 +135,11 @@ impl State {
 }
 
 #[derive(Debug, Clone)]
-struct TaskChannels {
+pub(crate) struct TaskChannels {
     pub(crate) aim_key_rx: watch::Receiver<AimKeyState>,
     pub(crate) aim_select_rx: watch::Receiver<Vec<AimTargetInfo>>,
     pub(crate) items_glow_rx: watch::Receiver<Vec<(u64, u8)>>,
+    pub(crate) update_time_rx: watch::Receiver<f64>,
 }
 
 trait TaskManager {
@@ -143,10 +159,24 @@ impl TaskManager for State {
 
         self.set_active(true);
 
-        let (access_tx, access_rx) = mpsc::channel(0x2000);
+        let (access_tx, access_rx) = apexsky_dmalib::access::create_api();
         let (aim_key_tx, aim_key_rx) = watch::channel(AimKeyState::default());
         let (aim_select_tx, aim_select_rx) = watch::channel(vec![]);
         let (items_glow_tx, items_glow_rx) = watch::channel(vec![]);
+        let (update_time_tx, update_time_rx) = watch::channel(0.0);
+        let (usermod_tx, usermod_rx) = mpsc::unbounded_channel();
+        let usermod_tx = USERMOD_TX.write().insert(usermod_tx).clone();
+
+        let game_api = api_impl::GameApiHandle {
+            state: self.shared_state.clone(),
+            channels: TaskChannels {
+                aim_key_rx: aim_key_rx.clone(),
+                aim_select_rx: aim_select_rx.clone(),
+                items_glow_rx: items_glow_rx.clone(),
+                update_time_rx: update_time_rx.clone(),
+            },
+            access_tx: access_tx.clone(),
+        };
 
         self.io_thread = Some({
             let active_rx = self.active_tx.subscribe();
@@ -166,12 +196,18 @@ impl TaskManager for State {
                 }
             })
         });
+        self.usermod_t = Some(task::spawn(usermod_thr::usermod_loop(
+            Arc::new(game_api.clone()),
+            usermod_rx,
+        )));
         self.actions_t = Some(task::spawn(actions_loop(
             self.active_tx.subscribe(),
             self.shared_state.clone(),
             access_tx.clone(),
             aim_key_tx,
             aim_select_tx,
+            update_time_tx,
+            usermod_tx.clone(),
             aim_select_rx.clone(),
             items_glow_rx.clone(),
         )));
@@ -179,6 +215,7 @@ impl TaskManager for State {
             self.active_tx.subscribe(),
             self.shared_state.clone(),
             access_tx.clone(),
+            usermod_tx.clone(),
             aim_key_rx.clone(),
             aim_select_rx.clone(),
         )));
@@ -188,12 +225,7 @@ impl TaskManager for State {
         )));
         self.esp_t = Some(task::spawn(esp_loop(
             self.active_tx.subscribe(),
-            self.shared_state.clone(),
-            TaskChannels {
-                aim_key_rx,
-                aim_select_rx,
-                items_glow_rx,
-            },
+            game_api.clone(),
         )));
         self.items_t = Some(task::spawn(items_loop(
             self.active_tx.subscribe(),
@@ -217,6 +249,9 @@ impl TaskManager for State {
             handle.await.ok();
         }
         if let Some(handle) = self.items_t.take() {
+            handle.await.ok();
+        }
+        if let Some(handle) = self.usermod_t.take() {
             handle.await.ok();
         }
         if let Some(handle) = self.io_thread.take() {
@@ -295,6 +330,7 @@ impl TaskManager for State {
             }
         }
         check_thread(&mut self.io_thread, s!("io_thread"));
+        check_task(&mut self.usermod_t, s!("usermod_thread")).await;
         check_task(&mut self.actions_t, s!("actions_t")).await;
         check_task(&mut self.aim_t, s!("aim_t")).await;
         check_task(&mut self.control_t, s!("control_t")).await;
@@ -309,6 +345,8 @@ fn main() {
         s!("rolling.log"),
     ));
     init_logger(non_blocking, true);
+    #[cfg(unix)]
+    fix_log_permission();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -320,14 +358,14 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
 
-    tracing::debug!(?args, "{}", s!("start c9OI8lMNlvrc"));
+    tracing::debug!(?args, "{}", s!("start PJbGRfJ0aZpx"));
     __load_settings();
 
     let mut state = State::new();
 
     if args.len() == 2 {
         if args[1] == s!("menu") {
-            apexsky::menu::main().unwrap();
+            apexsky::menu::main(menu::CustomMenuLevel::ApexskyMenu.into()).unwrap();
             return;
         }
     }
@@ -339,12 +377,30 @@ fn main() {
         debug_mode = true;
     }
 
+    // // Create a background thread which checks for deadlocks every 10s
+    // rt.spawn_blocking(|| loop {
+    //     std::thread::sleep(Duration::from_secs(10));
+    //     let deadlocks = parking_lot::deadlock::check_deadlock();
+    //     if deadlocks.is_empty() {
+    //         continue;
+    //     }
+
+    //     tracing::warn!("{} deadlocks detected", deadlocks.len());
+    //     for (i, threads) in deadlocks.iter().enumerate() {
+    //         tracing::warn!("Deadlock #{}", i);
+    //         for t in threads {
+    //             tracing::warn!("Thread Id {:#?}", t.thread_id());
+    //             tracing::warn!("{:#?}", t.backtrace());
+    //         }
+    //     }
+    // });
+
     rt.block_on(state.start_tasks());
 
     rt.block_on(async move {
         loop {
             state
-                .toggle_tui_active(if state.shared_state.read().game_baseaddr.is_some() {
+                .toggle_tui_active(if state.shared_state.get_game_baseaddr().is_some() {
                     !debug_mode
                 } else {
                     false
@@ -392,7 +448,7 @@ fn init_logger(non_blocking: NonBlocking, print: bool) {
     let filter_layer = EnvFilter::try_from_default_env()
         .or_else(|_| {
             EnvFilter::try_new(s!(
-                "apexsky_dma=warn,apexsky=warn,apexsky_dmalib=info,apexsky_dma::actuator=info,apexsky_dma::workers::aim=warn,apexsky_dma::workers::actions=warn,apexsky_dma::workers::esp=warn,apexsky_dma::apexdream=warn"
+                "apexsky_dma=warn,apexsky=warn,apexsky_dmalib=info,apexsky_extension=info,apexsky_dma::actuator=info,apexsky_dma::usermod_thr=warn,apexsky_dma::workers::aim=warn,apexsky_dma::workers::actions=warn,apexsky_dma::workers::esp=warn,apexsky_dma::workers::items=info,apexsky_dma::apexdream=warn"
             ))
         })
         .unwrap();
@@ -428,4 +484,48 @@ fn init_logger(non_blocking: NonBlocking, print: bool) {
         tracing::subscriber::set_global_default(subscriber)
     }
     .expect(s!("setting default subscriber failed"));
+}
+
+#[cfg(unix)]
+fn fix_log_permission() {
+    use nix::unistd::{Gid, Uid};
+    use std::fs;
+    use std::os::unix::fs::{chown, MetadataExt};
+    use uzers::{get_current_uid, get_user_by_uid};
+
+    let current_uid = get_current_uid();
+
+    if current_uid == 0 {
+        let original_user_uid = match std::env::var(s!("SUDO_UID")) {
+            Ok(var) => Uid::from_raw(var.parse::<u32>().expect(s!("Invalid SUDO_UID"))),
+            Err(_) => return,
+        };
+        let original_user_gid = Gid::from_raw(
+            std::env::var(s!("SUDO_GID"))
+                .expect(s!("Faild to read SUDO_GID"))
+                .parse::<u32>()
+                .expect(s!("Invalid SUDO_GID")),
+        );
+
+        let original_user =
+            get_user_by_uid(original_user_uid.into()).expect(s!("Failed to get original user"));
+
+        let metadata = fs::metadata(s!("log")).expect(s!("Failed to get metadata of log folder"));
+        let current_file_uid = Uid::from_raw(metadata.uid());
+        let current_file_gid = Gid::from_raw(metadata.gid());
+
+        if current_file_uid != original_user_uid || current_file_gid != original_user_gid {
+            tracing::warn!(
+                "{}{:?}",
+                s!("Changing ownership of 'log' folder to user: "),
+                original_user.name()
+            );
+            chown(
+                s!("log"),
+                Some(original_user_uid.into()),
+                Some(original_user_gid.into()),
+            )
+            .expect(s!("Failed to change ownership of log folder"));
+        }
+    }
 }

@@ -1,34 +1,160 @@
-use apexsky_proto::pb::apexlegends::EspData;
-use apexsky_proto::pb::apexlegends::EspSettings;
-use apexsky_proto::pb::apexlegends::EspVisualsFlag;
-use apexsky_proto::pb::apexlegends::Loots;
-use apexsky_proto::pb::apexlegends::LoveStatusCode;
-use apexsky_proto::pb::apexlegends::PlayerState;
-use apexsky_proto::pb::apexlegends::SpectatorInfo;
+use std::collections::HashMap;
+
 use bevy::diagnostic::DiagnosticsStore;
 use bevy::diagnostic::FrameTimeDiagnosticsPlugin;
 use bevy::prelude::*;
 use bevy_egui::egui::pos2;
 use bevy_egui::egui::Align2;
 use bevy_egui::{egui, EguiContexts};
+use instant::Instant;
 use obfstr::obfstr as s;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
+use serde::Deserialize;
+use serde::Serialize;
 
-use crate::overlay::get_unix_timestamp_in_millis;
+use crate::overlay::system::game_esp::ShowEntityBall;
 use crate::overlay::ui::mini_map::mini_map_radar;
 use crate::overlay::ui::mini_map::RadarTarget;
+use crate::overlay::utils::get_unix_timestamp_in_millis;
+use crate::pb::apexlegends::AimTargetHitbox;
+use crate::pb::apexlegends::EspData;
+use crate::pb::apexlegends::EspSettings;
+use crate::pb::apexlegends::EspVisualsFlag;
+use crate::pb::apexlegends::Loots;
+use crate::pb::apexlegends::LoveStatusCode;
+use crate::pb::apexlegends::PlayerState;
+use crate::pb::apexlegends::SpectatorInfo;
 
 use super::asset::Blob;
+use super::embedded;
+use super::system::game_esp::EspServiceAddr;
+use super::system::game_esp::EspSystem;
 use super::MyOverlayState;
 
+mod hud;
 mod mini_map;
+
+static ID_HELLO_WINDOW: Lazy<egui::Id> = Lazy::new(|| egui::Id::new(s!("#hello_window")));
+static ID_RADAR_WINDOW: Lazy<egui::Id> = Lazy::new(|| egui::Id::new(s!("#radar_window")));
 
 // A simple system to handle some keyboard input and toggle on/off the hittest.
 pub fn toggle_mouse_passthrough(
     keyboard_input: Res<ButtonInput<KeyCode>>,
     mut windows: Query<&mut Window>,
 ) {
-    let mut window = windows.single_mut();
-    window.cursor.hit_test = keyboard_input.pressed(KeyCode::Insert);
+    #[cfg(feature = "native")]
+    {
+        let mut window = windows.single_mut();
+        window.cursor.hit_test = keyboard_input.pressed(KeyCode::Insert);
+    }
+}
+
+#[derive(Debug, Resource, Serialize, Deserialize)]
+pub(crate) struct UiPersistance {
+    hello_position: Option<(f32, f32)>,
+    radar_position: Option<(f32, f32)>,
+    #[serde(skip)]
+    change_time: Option<Instant>,
+    pub(crate) draw_hud: bool,
+}
+
+impl Default for UiPersistance {
+    fn default() -> Self {
+        Self {
+            hello_position: None,
+            radar_position: None,
+            change_time: None,
+            draw_hud: true,
+        }
+    }
+}
+
+impl UiPersistance {
+    #[cfg(feature = "native")]
+    fn file_path() -> anyhow::Result<std::path::PathBuf> {
+        let current_dir = std::env::current_dir()?;
+        Ok(current_dir.join(s!("./overlay-ui.json")))
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn load_persistance() -> anyhow::Result<Self> {
+        use std::fs::File;
+        use std::io::BufReader;
+
+        let file = File::open(Self::file_path()?)?;
+        let reader = BufReader::new(file);
+        let saved: Self = serde_json::from_reader(reader)?;
+        Ok(Self {
+            hello_position: saved.hello_position,
+            radar_position: saved.radar_position,
+            change_time: None,
+            draw_hud: saved.draw_hud,
+        })
+    }
+    pub(crate) fn update(&mut self, mem: &egui::Memory) {
+        if let Some(rect_hello) = mem.area_rect(*ID_HELLO_WINDOW) {
+            let pos = rect_hello.left_top();
+            if self
+                .hello_position
+                .is_none_or(|(x, y)| x != pos.x || y != pos.y)
+            {
+                self.hello_position = Some((pos.x, pos.y));
+                self.change_time = Some(Instant::now());
+            }
+        }
+        if let Some(rect_radar) = mem.area_rect(*ID_RADAR_WINDOW) {
+            let pos = rect_radar.left_top();
+            if self
+                .radar_position
+                .is_none_or(|(x, y)| x != pos.x || y != pos.y)
+            {
+                self.radar_position = Some((pos.x, pos.y));
+                self.change_time = Some(Instant::now());
+            }
+        }
+        if let Some(change_time) = self.change_time {
+            if change_time.elapsed().as_millis() > 500 {
+                if let Err(e) = self.persistance() {
+                    tracing::error!(%e, ?e);
+                }
+                self.change_time = None;
+            }
+        }
+    }
+    #[cfg(feature = "native")]
+    fn persistance(&self) -> anyhow::Result<()> {
+        use std::fs;
+        use std::io::Write;
+
+        let mut persistance_write = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(Self::file_path()?)?;
+        let data = serde_json::to_string(self)?;
+        write!(persistance_write, "{}", data)?;
+        Ok(())
+    }
+    #[cfg(not(feature = "native"))]
+    fn persistance(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+enum DialogUiBar {
+    #[default]
+    NotShown,
+    InputAddr,
+    SettingsBar,
+}
+
+#[derive(Resource, Debug, Default)]
+pub(crate) struct UiState {
+    input_esp_addr: String,
+    input_addr_valid: Option<EspServiceAddr>,
+    toggle_bar: DialogUiBar,
 }
 
 struct DialogEsp {
@@ -49,18 +175,31 @@ struct DialogEsp {
 
 #[tracing::instrument(skip_all)]
 pub fn ui_system(
+    mut commands: Commands,
     mut contexts: EguiContexts,
     mut overlay_state: ResMut<MyOverlayState>,
+    mut ui_persistance: ResMut<UiPersistance>,
+    mut ui_state: ResMut<UiState>,
+    mut show_entity_ball: ResMut<ShowEntityBall>,
+    mut esp_system: Option<ResMut<EspSystem>>,
     time: Res<Time>,
     diagnostics: Res<DiagnosticsStore>,
     blobs: Res<Assets<Blob>>,
+    font_blob: Option<Res<embedded::FontBlob>>,
+    hud_image_handle: Res<embedded::EspHudImage>,
 ) {
     use egui::{CentralPanel, Color32, ScrollArea};
+
+    let hud_image = contexts.image_id(&hud_image_handle).unwrap();
+    let mut hud = hud::HUD
+        .get_or_init(|| Mutex::new(hud::Hud::new(hud_image)))
+        .lock();
+
     let ctx = contexts.ctx_mut();
 
     // Set default font
-    if !overlay_state.font_loaded {
-        if let Some(font_blob) = blobs.get(&overlay_state.font_blob) {
+    if let Some(font_blob_handle) = font_blob {
+        if let Some(font_blob) = blobs.get(&font_blob_handle.0) {
             let mut egui_fonts = egui::FontDefinitions::default();
             egui_fonts.font_data.insert(
                 "my_font".to_owned(),
@@ -78,15 +217,18 @@ pub fn ui_system(
                 .push("my_font".to_owned());
             ctx.set_fonts(egui_fonts);
 
-            overlay_state.font_loaded = true;
+            commands.remove_resource::<embedded::FontBlob>();
         }
     }
 
-    let (allied_spectators, spectators): (Vec<_>, Vec<_>) = overlay_state
-        .esp_data
-        .spectators
-        .clone()
-        .map(|list| list.elements)
+    let (allied_spectators, spectators): (Vec<_>, Vec<_>) = esp_system
+        .as_ref()
+        .and_then(|v| {
+            v.get_esp_data()
+                .spectators
+                .clone()
+                .map(|list| list.elements)
+        })
         .unwrap_or(vec![])
         .into_iter()
         .partition(|info| info.is_teammate);
@@ -96,121 +238,132 @@ pub fn ui_system(
         .map(|info| info.name)
         .collect();
 
-    let dialog_esp = DialogEsp {
-        overlay_fps: {
-            // try to get a "smoothed" FPS value from Bevy
-            if let Some(value) = diagnostics
-                .get(&FrameTimeDiagnosticsPlugin::FPS)
-                .and_then(|fps| fps.smoothed())
-            {
-                format!("{:.1}", value)
-            } else {
-                s!("N/A").to_string()
-            }
-        },
-        game_fps: format!("{:.1}", overlay_state.esp_data.game_fps),
-        latency: format!(
-            "{:.0}{}{:.0}{}",
-            overlay_state.data_latency,
-            s!("ms(data) + "),
-            time.delta_seconds() * 1000.0,
-            s!("ms(ui)"),
-        ),
-        loop_duration: format!(
-            "{: >4}{}{: >4}{}",
-            overlay_state.esp_data.duration_tick,
-            s!("ms(tick) +"),
-            overlay_state.esp_data.duration_actions,
-            s!("ms(actions)"),
-        ),
-        target_count: overlay_state.target_count.to_string(),
-        local_position: overlay_state
-            .esp_data
-            .local_player
-            .as_ref()
-            .and_then(|p| p.origin.clone())
-            .map(|pos| {
-                format!(
-                    "{}{:.0}{}{:.0}{}{:.0}",
-                    s!("x="),
-                    pos.x,
-                    s!(", y="),
-                    pos.y,
-                    s!(", z="),
-                    pos.z
-                )
-            })
-            .unwrap_or_default(),
-        local_angles: overlay_state
-            .esp_data
-            .local_player
-            .as_ref()
-            .and_then(|p| p.view_angles.clone())
-            .map(|angle| {
-                format!(
-                    "{}{:.2}{}{:.2}{}{:.2}",
-                    s!("view angles= "),
-                    angle.x,
-                    s!(", "),
-                    angle.y,
-                    s!(", "),
-                    angle.z
-                )
-            })
-            .unwrap_or_default(),
-        local_yaw: overlay_state
-            .esp_data
-            .local_player
-            .as_ref()
-            .map(|p| p.yaw)
-            .map(|yaw| format!("{}{:.2}", s!("yaw="), yaw))
-            .unwrap_or_default(),
-        local_held: overlay_state
-            .esp_data
-            .aimbot
-            .as_ref()
-            .map(|aimbot| {
-                format!(
-                    "{}{}{}{}",
-                    s!("held="),
-                    aimbot.held_id,
-                    s!(", weapon="),
-                    aimbot.weapon_id
-                )
-            })
-            .unwrap_or_default(),
-        aim_position: overlay_state
-            .esp_data
-            .aimbot
-            .as_ref()
-            .map(|aimbot| aimbot.target_position.as_ref())
-            .flatten()
-            .map(|aim_target| {
-                format!(
-                    "{}{:.2}{}{:.2}{}{:.2}{}",
-                    s!("aim["),
-                    aim_target.x,
-                    s!(","),
-                    aim_target.y,
-                    s!(","),
-                    aim_target.z,
-                    s!("]")
-                )
-            })
-            .unwrap_or_default(),
-        spectator_list: spectators,
-        allied_spectator_name,
-        teammates_info: overlay_state
-            .esp_data
-            .teammates
-            .clone()
-            .map(|dt| dt.players)
-            .unwrap_or_default(),
+    let dialog_esp = {
+        let esp_system = esp_system.as_ref();
+        DialogEsp {
+            overlay_fps: {
+                // try to get a "smoothed" FPS value from Bevy
+                if let Some(value) = diagnostics
+                    .get(&FrameTimeDiagnosticsPlugin::FPS)
+                    .and_then(|fps| fps.smoothed())
+                {
+                    format!("{:.1}", value)
+                } else {
+                    s!("N/A").to_string()
+                }
+            },
+            game_fps: format!(
+                "{:.1}",
+                esp_system
+                    .map(|v| v.get_esp_data().game_fps)
+                    .unwrap_or_default()
+            ),
+            latency: format!(
+                "{:.0}{}{:.0}{}{:.0}{}",
+                overlay_state.data_latency,
+                s!("ms(data): .. + "),
+                esp_system
+                    .and_then(|v| v.last_data_traffic_time)
+                    .map(|t| t.as_millis() as i32)
+                    .unwrap_or(-1),
+                s!("ms(net) + "),
+                time.delta_seconds() * 1000.0,
+                s!("ms(ui)"),
+            ),
+            loop_duration: esp_system
+                .map(|v| {
+                    let data = v.get_esp_data();
+                    format!(
+                        "{}{: >2}{}{: >2}{}",
+                        s!("actions: "),
+                        data.duration_actions,
+                        s!("ms (tick:"),
+                        data.duration_tick,
+                        s!("ms)"),
+                    )
+                })
+                .unwrap_or_default(),
+            target_count: esp_system
+                .map(|v| v.get_target_count())
+                .unwrap_or_default()
+                .to_string(),
+            local_position: esp_system
+                .and_then(|v| v.get_view_player())
+                .and_then(|pl| pl.origin.clone())
+                .map(|pos| {
+                    format!(
+                        "{}{:.0}{}{:.0}{}{:.0}",
+                        s!("x="),
+                        pos.x,
+                        s!(", y="),
+                        pos.y,
+                        s!(", z="),
+                        pos.z
+                    )
+                })
+                .unwrap_or_default(),
+            local_angles: esp_system
+                .and_then(|v| v.get_view_player())
+                .and_then(|pl| pl.view_angles.clone())
+                .map(|angle| {
+                    format!(
+                        "{}{:.2}{}{:.2}{}{:.2}",
+                        s!("view angles= "),
+                        angle.x,
+                        s!(", "),
+                        angle.y,
+                        s!(", "),
+                        angle.z
+                    )
+                })
+                .unwrap_or_default(),
+            local_yaw: esp_system
+                .and_then(|v| v.get_view_player())
+                .map(|pl| pl.yaw)
+                .map(|yaw| format!("{}{:.2}", s!("yaw="), yaw))
+                .unwrap_or_default(),
+            local_held: esp_system
+                .and_then(|v| v.get_esp_data().aimbot.as_ref())
+                .map(|aimbot| {
+                    format!(
+                        "{}{}{}{}",
+                        s!("held="),
+                        aimbot.held_id,
+                        s!(", weapon="),
+                        aimbot.weapon_id
+                    )
+                })
+                .unwrap_or_default(),
+            aim_position: esp_system
+                .and_then(|v| v.get_esp_data().aimbot.as_ref())
+                .map(|aimbot| aimbot.target_position.as_ref())
+                .flatten()
+                .map(|aim_target| {
+                    format!(
+                        "{}{:.2}{}{:.2}{}{:.2}{}",
+                        s!("aim["),
+                        aim_target.x,
+                        s!(","),
+                        aim_target.y,
+                        s!(","),
+                        aim_target.z,
+                        s!("]")
+                    )
+                })
+                .unwrap_or_default(),
+            spectator_list: spectators,
+            allied_spectator_name,
+            teammates_info: esp_system
+                .and_then(|v| v.get_esp_data().teammates.clone())
+                .map(|dt| dt.players)
+                .unwrap_or_default(),
+        }
     };
 
-    egui::Window::new(s!("Hello, world!"))
+    let _show = egui::Window::new(s!("Hello, world!"))
+        .id(*ID_HELLO_WINDOW)
         .auto_sized()
-        .default_pos(pos2(1600.0, 320.0))
+        .default_pos(ui_persistance.hello_position.unwrap_or((1600.0, 320.0)))
         .frame(egui::Frame {
             inner_margin: egui::Margin::same(8.0),
             outer_margin: egui::Margin::ZERO,
@@ -254,6 +407,7 @@ pub fn ui_system(
             ui.add_space(10.0);
 
             ScrollArea::vertical()
+                .id_source(s!("scroll-teammates"))
                 .max_width(320.0)
                 .max_height(480.0)
                 .show(ui, |ui| {
@@ -265,15 +419,35 @@ pub fn ui_system(
                         ui.label(s!("no teammates"));
                     }
 
-                    for teammate in dialog_esp.teammates_info.iter() {
+                    let view_teammate_index =
+                        esp_system.as_ref().and_then(|v| v.get_view_teammate());
+                    for (teammate_index, teammate) in dialog_esp.teammates_info.iter().enumerate() {
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                            let name = teammate.player_name.to_owned();
+                            let name_text = {
+                                let name = teammate.player_name.to_owned();
+                                if dialog_esp.allied_spectator_name.contains(&name) {
+                                    egui::RichText::new(name).strong().color(Color32::GREEN)
+                                } else {
+                                    egui::RichText::new(name).strong()
+                                }
+                            };
                             ui.label(format!("{} - ", teammate.team_member_index));
-                            ui.label(if dialog_esp.allied_spectator_name.contains(&name) {
-                                egui::RichText::new(name).strong().color(Color32::GREEN)
+
+                            if Some(teammate_index) == view_teammate_index {
+                                ui.label(name_text);
+                                if ui.add(egui::Button::new(s!("👓"))).clicked() {
+                                    if let Some(v) = esp_system.as_mut() {
+                                        v.set_view_teammate(None);
+                                    }
+                                }
                             } else {
-                                egui::RichText::new(name).strong()
-                            });
+                                if ui.add(egui::Button::new(name_text)).clicked() {
+                                    if let Some(v) = esp_system.as_mut() {
+                                        v.set_view_teammate(Some(teammate_index));
+                                    }
+                                }
+                            }
+
                             ui.add_space(5.0);
                             ui.label(teammate.damage_dealt.to_string());
                             ui.add_space(5.0);
@@ -285,6 +459,7 @@ pub fn ui_system(
             ui.add_space(10.0);
 
             ScrollArea::vertical()
+                .id_source(s!("scroll-spectators"))
                 .max_width(320.0)
                 .max_height(480.0)
                 .show(ui, |ui| {
@@ -316,75 +491,257 @@ pub fn ui_system(
                         };
                     }
                 });
+
+            ui.add_space(10.0);
+
+            // buttons
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                if ui
+                    .add(egui::Button::new(
+                        egui::RichText::new(s!("Connection")).color((|| {
+                            // gRPC not connected: red
+                            let Some(esp_system) = esp_system.as_ref() else {
+                                return Color32::LIGHT_RED;
+                            };
+                            // ESP service no response: yellow
+                            let Some(response_time) = esp_system.last_data_response_time else {
+                                return Color32::YELLOW;
+                            };
+                            // ESP service timeout: yellow
+                            if response_time.elapsed().as_millis() > 200 {
+                                return Color32::LIGHT_YELLOW;
+                            }
+                            // Not attached to game: blue
+                            if !esp_system.get_esp_data().ready {
+                                return Color32::LIGHT_BLUE;
+                            }
+                            // Not in game: green
+                            if !esp_system.get_esp_data().in_game {
+                                return Color32::LIGHT_GREEN;
+                            }
+                            // in game: green blink
+                            if time.elapsed_seconds() as i32 % 2 == 0 {
+                                Color32::LIGHT_GREEN
+                            } else {
+                                Color32::GREEN
+                            }
+                        })()),
+                    ))
+                    .clicked()
+                {
+                    // For audio in browser
+                    overlay_state.user_gesture = true;
+
+                    // Toggle address TextEdit
+                    if ui_state.toggle_bar != DialogUiBar::InputAddr {
+                        // set value and show
+                        if ui_state.input_esp_addr.is_empty() {
+                            ui_state.input_esp_addr = overlay_state
+                                .override_esp_addr
+                                .as_ref()
+                                .map(|addr| addr.get_addr())
+                                .or(esp_system.as_ref().map(|v| v.get_endpoint()))
+                                .unwrap_or(EspServiceAddr::default().get_addr())
+                                .to_owned();
+                        }
+                        ui_state.input_addr_valid =
+                            EspServiceAddr::from_str(&ui_state.input_esp_addr);
+                        ui_state.toggle_bar = DialogUiBar::InputAddr;
+                    } else {
+                        // validate input and override address
+                        if let Some(valid_input) = &ui_state.input_addr_valid {
+                            if esp_system
+                                .as_ref()
+                                .is_none_or(|v| v.get_endpoint() != valid_input.get_addr())
+                            {
+                                overlay_state.override_esp_addr = ui_state.input_addr_valid.clone();
+                            }
+                        }
+                        // clear and dismiss
+                        ui_state.input_esp_addr.clear();
+                        ui_state.toggle_bar = DialogUiBar::NotShown;
+                    }
+                }
+                if ui
+                    .add(egui::Button::new(if !overlay_state.user_gesture {
+                        egui::RichText::new(s!("Click me"))
+                    } else {
+                        egui::RichText::new(s!(" Ready  ")).color(Color32::LIGHT_GREEN)
+                    }))
+                    .clicked()
+                {
+                    overlay_state.user_gesture = true;
+                }
+                if ui.add(egui::Button::new(s!("Test sound"))).clicked() {
+                    overlay_state.test_sound = true;
+                }
+                if ui.add(egui::Button::new(s!("Settings"))).clicked() {
+                    overlay_state.user_gesture = true;
+                    if ui_state.toggle_bar == DialogUiBar::SettingsBar {
+                        ui_state.toggle_bar = DialogUiBar::NotShown;
+                    } else {
+                        ui_state.toggle_bar = DialogUiBar::SettingsBar;
+                    }
+                }
+            });
+
+            // address bar or settings bar
+            if ui_state.toggle_bar == DialogUiBar::InputAddr {
+                let invalid = ui_state.input_addr_valid.is_none();
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut ui_state.input_esp_addr)
+                        .text_color_opt(invalid.then_some(Color32::RED)),
+                );
+                // Validate input
+                if response.changed() {
+                    ui_state.input_addr_valid = EspServiceAddr::from_str(&ui_state.input_esp_addr);
+                }
+                // Submit input and dismiss
+                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    if ui_state.input_addr_valid.is_some() {
+                        overlay_state.override_esp_addr = ui_state.input_addr_valid.clone();
+                        ui_state.input_esp_addr.clear();
+                    }
+                }
+                // Quick input button
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                    if ui.add(egui::Button::new(s!("⬆ 127.0.0.1"))).clicked() {
+                        ui_state.input_esp_addr = s!("http://127.0.0.1:50051").to_string();
+                        ui_state.input_addr_valid =
+                            EspServiceAddr::from_str(&ui_state.input_esp_addr);
+                    }
+                    if ui.add(egui::Button::new(s!("⬆ 192.168.122.1"))).clicked() {
+                        ui_state.input_esp_addr = s!("http://192.168.122.1:50051").to_string();
+                        ui_state.input_addr_valid =
+                            EspServiceAddr::from_str(&ui_state.input_esp_addr);
+                    }
+                });
+            } else if ui_state.toggle_bar == DialogUiBar::SettingsBar {
+                ui.with_layout(egui::Layout::top_down_justified(egui::Align::Min), |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        ui.label(egui::RichText::new(s!("Black bg")));
+                        if ui
+                            .add(toggle_button(&mut overlay_state.black_background))
+                            .changed()
+                        {
+                            let bg_color = if overlay_state.black_background {
+                                Color::BLACK
+                            } else {
+                                Color::NONE
+                            };
+                            commands.insert_resource(ClearColor(bg_color));
+                        }
+                    });
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        ui.label(egui::RichText::new(s!("Show ball")));
+                        ui.add(toggle_button(&mut show_entity_ball.0));
+                    });
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        ui.label(egui::RichText::new(s!("Show HUD")));
+                        if ui
+                            .add(toggle_button(&mut ui_persistance.draw_hud))
+                            .changed()
+                        {
+                            ui_persistance.persistance().ok();
+                        }
+                    });
+                });
+            }
         });
 
-    let panel_frame = egui::Frame {
-        fill: Color32::TRANSPARENT, //ctx.style().visuals.window_fill(),
-        rounding: 10.0.into(),
-        stroke: egui::Stroke::NONE, //ctx.style().visuals.widgets.noninteractive.fg_stroke,
-        outer_margin: 0.5.into(),   // so the stroke is within the bounds
-        ..Default::default()
-    };
+    if let Some(ref esp_system_connected) = esp_system {
+        let esp_settings = esp_system_connected.get_esp_settings();
+        let esp_data = esp_system_connected.get_esp_data();
+        let esp_loots = esp_system_connected.get_esp_loots();
+        let view_player = esp_system_connected.get_view_player();
 
-    CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
-        esp_2d_ui(
-            ui,
-            &overlay_state.esp_data,
-            &overlay_state.esp_settings,
-            &overlay_state.esp_loots,
-        );
-        info_bar_ui(
-            ui,
-            &overlay_state.esp_data,
-            spectators_count,
-            allied_spectators_count,
-        );
-    });
+        let panel_frame = egui::Frame {
+            fill: Color32::TRANSPARENT, //ctx.style().visuals.window_fill(),
+            rounding: 10.0.into(),
+            stroke: egui::Stroke::NONE, //ctx.style().visuals.widgets.noninteractive.fg_stroke,
+            outer_margin: 0.5.into(),   // so the stroke is within the bounds
+            ..Default::default()
+        };
 
-    // Radar Stuff
-    if overlay_state.esp_data.in_game && overlay_state.esp_settings.mini_map_radar {
-        if let Some((base_pos, base_yaw)) = overlay_state.esp_data.view_player.as_ref().map(|pl| {
-            (
-                pl.origin.clone().unwrap().into(),
-                pl.view_angles.as_ref().map(|v| v.y).unwrap_or(pl.yaw),
-            )
-        }) {
-            let radar_targets = overlay_state
-                .esp_data
-                .targets
-                .as_ref()
-                .map(|list| &list.elements)
-                .unwrap_or(&vec![])
-                .iter()
-                .filter_map(|item| Some((item.info.as_ref()?, item.player_data.as_ref()?)))
-                .map(|(player_info, player_buf)| RadarTarget {
-                    pos: player_buf.origin.clone().unwrap().into(),
-                    yaw: player_buf
-                        .view_angles
-                        .as_ref()
-                        .map(|view_angles| {
-                            let yaw = view_angles.y;
-                            if yaw < 0.0 {
-                                yaw + 360.0
-                            } else {
-                                yaw
-                            }
-                        })
-                        .unwrap_or(player_buf.yaw),
-                    distance: player_info.distance / 39.62,
-                    team_id: player_buf.team_num,
-                })
-                .collect();
-            mini_map_radar(ctx, base_pos, base_yaw, radar_targets, 5., 1.);
+        // Draw 2D ESP for local player
+        let is_teammate_view = esp_system_connected.get_view_teammate().is_some();
+        CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
+            if !is_teammate_view {
+                esp_2d_ui(ui, esp_data, esp_settings, esp_loots, view_player);
+                if ui_persistance.draw_hud {
+                    hud.set_data(ui.ctx(), esp_data);
+                    hud.draw(ui);
+                }
+            }
+            info_bar_ui(
+                ui,
+                is_teammate_view,
+                esp_data,
+                spectators_count,
+                allied_spectators_count,
+            );
+        });
+
+        // Radar Stuff
+        if esp_data.in_game && esp_settings.mini_map_radar {
+            if let Some((base_pos, base_yaw)) = view_player.map(|pl| {
+                (
+                    pl.origin.clone().unwrap().into(),
+                    pl.view_angles.as_ref().map(|v| v.y).unwrap_or(pl.yaw),
+                )
+            }) {
+                let radar_targets = esp_data
+                    .targets
+                    .as_ref()
+                    .map(|list| &list.elements)
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|item| Some((item.info.as_ref()?, item.player_data.as_ref()?)))
+                    .map(|(player_info, player_buf)| RadarTarget {
+                        pos: player_buf.origin.clone().unwrap().into(),
+                        yaw: player_buf
+                            .view_angles
+                            .as_ref()
+                            .map(|view_angles| {
+                                let yaw = view_angles.y;
+                                if yaw < 0.0 {
+                                    yaw + 360.0
+                                } else {
+                                    yaw
+                                }
+                            })
+                            .unwrap_or(player_buf.yaw),
+                        distance: player_info.distance / 39.62,
+                        team_id: player_buf.team_num,
+                    })
+                    .collect();
+                let default_position = ui_persistance.radar_position.unwrap_or((45.0, 45.0));
+                mini_map_radar(
+                    ctx,
+                    base_pos,
+                    base_yaw,
+                    radar_targets,
+                    default_position,
+                    5.,
+                    1.,
+                );
+            }
         }
     }
 
     let now = get_unix_timestamp_in_millis() as f64;
-    overlay_state.data_latency = now - overlay_state.esp_data.data_timestamp * 1000.0;
+    overlay_state.data_latency = now
+        - esp_system
+            .map(|v| v.get_esp_data().data_timestamp)
+            .unwrap_or(0.0)
+            * 1000.0;
+
+    ctx.memory(|mem| ui_persistance.update(mem));
 }
 
 fn info_bar_ui(
     ui: &mut egui::Ui,
+    is_teammate_view: bool,
     esp_data: &EspData,
     spectators_count: usize,
     allied_spectators_count: usize,
@@ -399,7 +756,13 @@ fn info_bar_ui(
     }
 
     let info = {
-        if let Some(aimbot) = esp_data.aimbot.as_ref() {
+        if is_teammate_view {
+            EspInfo {
+                aimbot_fov: 0.0,
+                aimbot_status_text: s!("[Teammate ESP]").to_string(),
+                aimbot_status_color: Color32::GREEN,
+            }
+        } else if let Some(aimbot) = esp_data.aimbot.as_ref() {
             let aimbot_mode = aimbot.aim_mode;
             let (aimbot_status_color, aimbot_status_text) = if aimbot.target_locked {
                 (
@@ -506,7 +869,13 @@ fn info_bar_ui(
     });
 }
 
-fn esp_2d_ui(ui: &mut egui::Ui, esp_data: &EspData, esp_settings: &EspSettings, esp_loots: &Loots) {
+fn esp_2d_ui(
+    ui: &mut egui::Ui,
+    esp_data: &EspData,
+    esp_settings: &EspSettings,
+    esp_loots: &Loots,
+    view_player: Option<&PlayerState>,
+) {
     use egui::{Color32, Rect};
 
     if !esp_data.in_game {
@@ -529,20 +898,408 @@ fn esp_2d_ui(ui: &mut egui::Ui, esp_data: &EspData, esp_settings: &EspSettings, 
         family: egui::FontFamily::Proportional,
     };
 
+    let (box_color_viz, box_color_not_viz) = {
+        let color_viz: [f32; 3] = esp_settings.glow_color_viz.clone().unwrap().into();
+        let color_notviz: [f32; 3] = esp_settings.glow_color_notviz.clone().unwrap().into();
+        let convert = |v: f32| -> u8 { (v.clamp(0.0, 1.0) * 255.0).round() as u8 };
+        (
+            (
+                convert(color_viz[0]),
+                convert(color_viz[1]),
+                convert(color_viz[2]),
+            ),
+            (
+                convert(color_notviz[0]),
+                convert(color_notviz[1]),
+                convert(color_notviz[2]),
+            ),
+        )
+    };
+
+    // Drow aim target visuals
+    esp_data
+        .targets
+        .as_ref()
+        .map(|list| &list.elements)
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|item| {
+            Some((
+                item.info.as_ref()?,
+                item.data.as_ref()?,
+                item.player_data.as_ref(),
+                &item.hitboxes,
+            ))
+        })
+        .for_each(|(target_info, target_data, player_data, hitboxes)| {
+            let aim_distance = esp_settings.aim_distance;
+            let alpha = if target_info.distance < aim_distance {
+                1.0
+            } else if target_info.distance > 16000.0 {
+                0.4
+            } else {
+                1.0 - (target_info.distance - aim_distance) / (16000.0 - aim_distance) * 0.6
+            };
+            let alpha = (255.0 * alpha.clamp(0.0, 1.0)).round() as u8;
+            let radar_distance = (target_info.distance / 39.62).round() as i32;
+
+            let head_position = target_data.head_position.clone().unwrap();
+            let target_origin = target_data.position.clone().unwrap();
+            let Some(head_screen_pos) = world_to_screen(
+                head_position.into(),
+                &view_matrix,
+                screen_width,
+                screen_height,
+            ) else {
+                return;
+            };
+            let Some(bottom_screen_pos) = world_to_screen(
+                target_origin.into(),
+                &view_matrix,
+                screen_width,
+                screen_height,
+            ) else {
+                return;
+            };
+            let box_height = (head_screen_pos.y - bottom_screen_pos.y).abs();
+            let box_width = box_height / 2.0;
+            let box_middle_x = bottom_screen_pos.x;
+
+            // draw distance label
+            if esp_settings.esp_visuals & EspVisualsFlag::Distance as i32 != 0 {
+                let distance_text = format!(
+                    "{}{}{}{}{}",
+                    radar_distance,
+                    s!("m("),
+                    target_data.team_num,
+                    if target_info.is_npc {
+                        s!(",npc").to_owned()
+                    } else {
+                        String::new()
+                    },
+                    s!(")")
+                );
+                let color = if target_info.is_knocked {
+                    Color32::RED
+                } else {
+                    Color32::from_rgba_unmultiplied(0, 255, 0, alpha)
+                };
+                let pos = pos2(box_middle_x, bottom_screen_pos.y + 1.0);
+                ui.painter().text(
+                    pos,
+                    Align2::CENTER_CENTER,
+                    distance_text,
+                    font_id.clone(),
+                    color,
+                );
+            }
+
+            if target_info.distance < aim_distance {
+                // draw bone and box
+                let esp_bone = esp_settings.esp_visuals & EspVisualsFlag::Bone as i32 != 0;
+                let esp_box = esp_settings.esp_visuals & EspVisualsFlag::Box as i32 != 0;
+                if esp_bone || esp_box {
+                    const DRAW_HITBOX: bool = false;
+                    let (r, g, b) = if target_info.is_visible {
+                        box_color_viz
+                    } else {
+                        box_color_not_viz
+                    };
+                    let box_color = Color32::from_rgba_unmultiplied(r, g, b, alpha);
+                    let bone_screen_radius = box_height / 100.0;
+
+                    let mut bone_plots: HashMap<i32, Option<(egui::Pos2, f32)>> =
+                        HashMap::with_capacity(hitboxes.len());
+                    let mut bone_groups: HashMap<i32, Vec<(i32, egui::Pos2)>> =
+                        HashMap::with_capacity(hitboxes.len());
+                    let mut bone_lines: Vec<(i32, i32)> = Vec::with_capacity(hitboxes.len());
+
+                    let mut plot = |hb: &AimTargetHitbox| {
+                        if bone_plots.contains_key(&hb.bone) {
+                            return;
+                        }
+                        let AimTargetHitbox {
+                            bone,
+                            group,
+                            bbmin,
+                            bbmax,
+                            bone_origin,
+                            bone_parent: _,
+                            radius,
+                        } = hb.clone();
+                        bone_plots.insert(bone, None);
+
+                        let Some(bone_origin) = bone_origin else {
+                            return;
+                        };
+                        let bone_pos = [
+                            target_origin.x + bone_origin.x,
+                            target_origin.y + bone_origin.y,
+                            target_origin.z + bone_origin.z,
+                        ];
+                        let Some(bone_screen_pos) =
+                            world_to_screen(bone_pos, &view_matrix, screen_width, screen_height)
+                        else {
+                            return;
+                        };
+                        let bone_screen_pos = (bone_screen_pos.x, bone_screen_pos.y).into();
+
+                        bone_plots.insert(
+                            bone,
+                            Some((
+                                bone_screen_pos,
+                                if radius == 0.0 {
+                                    1.0
+                                } else {
+                                    bone_screen_radius
+                                },
+                            )),
+                        );
+
+                        if let Some(item) = bone_groups.get_mut(&group) {
+                            item.push((bone, bone_screen_pos));
+                        } else {
+                            bone_groups.insert(group, vec![(bone, bone_screen_pos)]);
+                        }
+
+                        if DRAW_HITBOX {
+                            let Some(bbmin) = bbmin else {
+                                return;
+                            };
+                            let Some(bbmax) = bbmax else {
+                                return;
+                            };
+                            let bone_pos_min = [
+                                bone_pos[0] + bbmin.x,
+                                bone_pos[1] + bbmin.y,
+                                bone_pos[2] + bbmin.z,
+                            ];
+                            let bone_pos_max = [
+                                bone_pos[0] + bbmax.x,
+                                bone_pos[1] + bbmax.y,
+                                bone_pos[2] + bbmax.z,
+                            ];
+                            let Some(bone_screen_pos_min) = world_to_screen(
+                                bone_pos_min,
+                                &view_matrix,
+                                screen_width,
+                                screen_height,
+                            ) else {
+                                return;
+                            };
+                            let Some(bone_screen_pos_max) = world_to_screen(
+                                bone_pos_max,
+                                &view_matrix,
+                                screen_width,
+                                screen_height,
+                            ) else {
+                                return;
+                            };
+                            ui.painter().rect_filled(
+                                Rect {
+                                    min: pos2(
+                                        f32::min(bone_screen_pos_min.x, bone_screen_pos_max.x),
+                                        f32::min(bone_screen_pos_min.y, bone_screen_pos_max.y),
+                                    ),
+                                    max: pos2(
+                                        f32::max(bone_screen_pos_min.x, bone_screen_pos_max.x),
+                                        f32::max(bone_screen_pos_min.y, bone_screen_pos_max.y),
+                                    ),
+                                },
+                                0.0,
+                                box_color,
+                            );
+                        }
+                    };
+
+                    for hb in hitboxes {
+                        plot(hb);
+                    }
+
+                    if esp_bone {
+                        // draw bone points
+                        for point in bone_plots.values() {
+                            if let Some((pos, radius)) = point {
+                                ui.painter().circle_filled(*pos, *radius, Color32::WHITE);
+                            }
+                        }
+
+                        // set bone lines
+                        const HITGROUP_GENERIC: i32 = 0;
+                        const HITGROUP_HEAD: i32 = 1;
+                        const HITGROUP_UPPER_BODY: i32 = 2;
+                        const HITGROUP_LOWER_BODY: i32 = 3;
+                        const HITGROUP_LEFT_HAND: i32 = 4;
+                        const HITGROUP_RIGHT_HAND: i32 = 5;
+                        const HITGROUP_LEFT_LEG: i32 = 6;
+                        const HITGROUP_RIGHT_LEG: i32 = 7;
+
+                        let find_top_bottom_bones = |l: &Vec<(i32, egui::Pos2)>| {
+                            let (mut start_bone, mut start_point) = l.first()?.clone();
+                            let (mut end_bone, mut end_point) = (start_bone, start_point);
+                            for (bone, pos) in l {
+                                if pos.y < start_point.y {
+                                    start_point = *pos;
+                                    start_bone = *bone;
+                                } else if pos.y > end_point.y {
+                                    end_point = *pos;
+                                    end_bone = *bone;
+                                }
+                            }
+                            Some((start_bone, end_bone))
+                        };
+
+                        let head = bone_groups
+                            .get(&HITGROUP_HEAD)
+                            .and_then(|l| Some((l.first()?.0, l.last()?.0)));
+                        let upper_body = bone_groups
+                            .get(&HITGROUP_UPPER_BODY)
+                            .and_then(find_top_bottom_bones);
+                        let lower_body = bone_groups
+                            .get(&HITGROUP_LOWER_BODY)
+                            .and_then(find_top_bottom_bones);
+                        let left_hand = bone_groups
+                            .get(&HITGROUP_LEFT_HAND)
+                            .and_then(|l| Some((l.first()?.0, l.last()?.0)));
+                        let right_hand = bone_groups
+                            .get(&HITGROUP_RIGHT_HAND)
+                            .and_then(|l| Some((l.first()?.0, l.last()?.0)));
+                        let left_leg = bone_groups
+                            .get(&HITGROUP_LEFT_LEG)
+                            .and_then(|l| Some((l.first()?.0, l.last()?.0)));
+                        let right_leg = bone_groups
+                            .get(&HITGROUP_RIGHT_LEG)
+                            .and_then(|l| Some((l.first()?.0, l.last()?.0)));
+
+                        for (group, list) in bone_groups {
+                            if group == HITGROUP_GENERIC {
+                                continue;
+                            }
+                            if list.len() < 2 {
+                                continue;
+                            }
+                            let mut prev_bone = list.first().unwrap().0;
+                            for (bone, _) in list {
+                                if bone != prev_bone {
+                                    bone_lines.push((prev_bone, bone));
+                                    prev_bone = bone;
+                                }
+                            }
+                        }
+
+                        (|| Some(bone_lines.push((head?.0, upper_body?.0))))();
+                        (|| Some(bone_lines.push((upper_body?.1, lower_body?.0))))();
+                        (|| Some(bone_lines.push((upper_body?.1, left_hand?.0))))();
+                        (|| Some(bone_lines.push((upper_body?.1, right_hand?.0))))();
+                        (|| Some(bone_lines.push((lower_body?.1, left_leg?.0))))();
+                        (|| Some(bone_lines.push((lower_body?.1, right_leg?.0))))();
+
+                        // draw bone lines
+                        for draw_line in bone_lines {
+                            if let (Some(point0), Some(point1)) = (
+                                bone_plots.get(&draw_line.0).cloned().flatten(),
+                                bone_plots.get(&draw_line.1).cloned().flatten(),
+                            ) {
+                                ui.painter()
+                                    .line_segment([point0.0, point1.0], (1.0, Color32::WHITE));
+                            }
+                        }
+                    }
+
+                    // draw box
+                    if esp_box {
+                        let mut pos_min = pos2(box_middle_x - box_width / 2.0, head_screen_pos.y);
+                        let mut pos_max = pos2(pos_min.x + box_width, pos_min.y + box_height);
+                        for point in bone_plots.values() {
+                            if let Some((pos, _)) = point {
+                                pos_min.x = f32::min(pos_min.x, pos.x);
+                                pos_min.y = f32::min(pos_min.y, pos.y);
+                                pos_max.x = f32::max(pos_max.x, pos.x);
+                                pos_max.y = f32::max(pos_max.y, pos.y);
+                            }
+                        }
+                        let stroke = (1.0, box_color);
+                        ui.painter().rect_stroke(
+                            Rect {
+                                min: pos_min,
+                                max: pos_max,
+                            },
+                            0.0,
+                            stroke,
+                        );
+                    }
+                }
+
+                // draw visuals for player target
+                if let Some(player_data) = player_data {
+                    // draw name label
+                    if esp_settings.esp_visuals & EspVisualsFlag::Name as i32 != 0 {
+                        let is_love: LoveStatusCode = target_info
+                            .love_status
+                            .try_into()
+                            .unwrap_or(LoveStatusCode::Normal);
+
+                        let name_color = if is_love == LoveStatusCode::Love {
+                            Color32::from_rgb(231, 27, 100)
+                        } else if is_love == LoveStatusCode::Hate {
+                            Color32::RED
+                        } else if is_love == LoveStatusCode::Ambivalent {
+                            Color32::BLACK
+                        } else {
+                            Color32::from_rgba_unmultiplied(255, 255, 255, alpha)
+                        };
+
+                        let draw_pos = pos2(box_middle_x, head_screen_pos.y - 15.0);
+                        let nick_pos = pos2(draw_pos.x + 50.0, draw_pos.y);
+
+                        let level_text = format!("{}{}", s!("Lv."), xp_level(player_data.xp));
+                        let level_color = Color32::from_rgba_unmultiplied(0, 255, 0, alpha);
+
+                        ui.painter().text(
+                            draw_pos,
+                            Align2::RIGHT_CENTER,
+                            level_text,
+                            font_id.clone(),
+                            level_color,
+                        );
+                        ui.painter().text(
+                            nick_pos,
+                            Align2::CENTER_CENTER,
+                            player_data.player_name.to_owned(),
+                            font_id.clone(),
+                            name_color,
+                        );
+                    }
+
+                    // draw damage label
+                    if esp_settings.esp_visuals & EspVisualsFlag::Damage as i32 != 0 {
+                        let color = Color32::from_rgb(188, 18, 20);
+                        let draw_pos = pos2(box_middle_x, head_screen_pos.y - 32.0);
+                        let damage_text = player_data.damage_dealt.to_string();
+                        ui.painter().text(
+                            draw_pos,
+                            Align2::CENTER_CENTER,
+                            damage_text,
+                            font_id.clone(),
+                            color,
+                        );
+                    }
+                }
+            }
+        });
+
+    // Draw aim target indicator
     if esp_settings.show_aim_target {
         if let Some(aim_pos) = (|| {
             let pos: [f32; 3] = esp_data.aimbot.as_ref()?.target_position.clone()?.into();
-            if !(pos[0] == 0.0 && pos[1] == 0.0 && pos[2] == 0.0) {
-                Some(pos)
-            } else {
-                None
-            }
+            Some(pos)
         })() {
-            let bs = world_to_screen(&aim_pos, &view_matrix, screen_width, screen_height)
-                .unwrap_or(Vec2 {
+            let bs = world_to_screen(aim_pos, &view_matrix, screen_width, screen_height).unwrap_or(
+                Vec2 {
                     x: screen_width / 2.0,
                     y: screen_height / 2.0,
-                });
+                },
+            );
 
             const INDICATOR_RADIUS: f32 = 10.0;
 
@@ -573,11 +1330,10 @@ fn esp_2d_ui(ui: &mut egui::Ui, esp_data: &EspData, esp_settings: &EspSettings, 
         }
     }
 
+    // Drow loots label
     if !esp_loots.loots.is_empty() {
         if let Some(bs_local) = world_to_screen(
-            &esp_data
-                .view_player
-                .as_ref()
+            view_player
                 .and_then(|p| p.origin.clone())
                 .unwrap_or_default()
                 .into(),
@@ -590,7 +1346,7 @@ fn esp_2d_ui(ui: &mut egui::Ui, esp_data: &EspData, esp_settings: &EspSettings, 
                     continue;
                 };
                 let Some(bs_loot) =
-                    world_to_screen(&position.into(), &view_matrix, screen_width, screen_height)
+                    world_to_screen(position.into(), &view_matrix, screen_width, screen_height)
                 else {
                     continue;
                 };
@@ -617,168 +1373,10 @@ fn esp_2d_ui(ui: &mut egui::Ui, esp_data: &EspData, esp_settings: &EspSettings, 
             }
         }
     }
-
-    let (box_color_viz, box_color_not_viz) = {
-        let color_viz: [f32; 3] = esp_settings.glow_color_viz.clone().unwrap().into();
-        let color_notviz: [f32; 3] = esp_settings.glow_color_notviz.clone().unwrap().into();
-        let convert = |v: f32| -> u8 { (v.max(0.0).min(1.0) * 255.0).round() as u8 };
-        (
-            (
-                convert(color_viz[0]),
-                convert(color_viz[1]),
-                convert(color_viz[2]),
-            ),
-            (
-                convert(color_notviz[0]),
-                convert(color_notviz[1]),
-                convert(color_notviz[2]),
-            ),
-        )
-    };
-
-    esp_data
-        .targets
-        .as_ref()
-        .map(|list| &list.elements)
-        .unwrap_or(&vec![])
-        .iter()
-        .filter_map(|item| Some((item.info.as_ref()?, item.player_data.as_ref()?)))
-        .for_each(|(player_info, player_data)| {
-            let head_position = player_data.head_position.clone().unwrap();
-            let bottom_position = player_data.origin.clone().unwrap();
-            let Some(head_screen_pos) = world_to_screen(
-                &head_position.into(),
-                &view_matrix,
-                screen_width,
-                screen_height,
-            ) else {
-                return;
-            };
-            let Some(bottom_screen_pos) = world_to_screen(
-                &bottom_position.into(),
-                &view_matrix,
-                screen_width,
-                screen_height,
-            ) else {
-                return;
-            };
-            let box_height = (head_screen_pos.y - bottom_screen_pos.y).abs();
-            let box_width = box_height / 2.0;
-            let box_middle_x = bottom_screen_pos.x - box_width / 2.0;
-
-            let aim_distance = esp_settings.aim_distance;
-
-            if esp_settings.esp_visuals & EspVisualsFlag::Damage as i32 != 0
-                && player_info.distance < aim_distance
-            {
-                let color = Color32::from_rgb(188, 18, 20);
-                let draw_pos = pos2(box_middle_x, head_screen_pos.y - 32.0);
-                let damage_text = player_data.damage_dealt.to_string();
-                ui.painter().text(
-                    draw_pos,
-                    Align2::CENTER_CENTER,
-                    damage_text,
-                    font_id.clone(),
-                    color,
-                );
-            }
-
-            let alpha = if player_info.distance < aim_distance {
-                1.0
-            } else if player_info.distance > 16000.0 {
-                0.4
-            } else {
-                1.0 - (player_info.distance - aim_distance) / (16000.0 - aim_distance) * 0.6
-            };
-            let alpha = (255.0 * alpha.max(0.0).min(1.0)).round() as u8;
-            let radar_distance = (player_info.distance / 39.62).round() as i32;
-
-            if esp_settings.esp_visuals & EspVisualsFlag::Distance as i32 != 0 {
-                let distance_text = format!(
-                    "{}{}{}{}",
-                    radar_distance,
-                    s!("m("),
-                    player_data.team_num,
-                    s!(")")
-                );
-                let color = if player_data.is_knocked {
-                    Color32::RED
-                } else {
-                    Color32::from_rgba_unmultiplied(0, 255, 0, alpha)
-                };
-                let pos = pos2(box_middle_x, bottom_screen_pos.y + 1.0);
-                ui.painter().text(
-                    pos,
-                    Align2::CENTER_CENTER,
-                    distance_text,
-                    font_id.clone(),
-                    color,
-                );
-            }
-
-            if player_info.distance < aim_distance {
-                if esp_settings.esp_visuals & EspVisualsFlag::Box as i32 != 0 {
-                    let (r, g, b) = if player_info.is_visible {
-                        box_color_viz
-                    } else {
-                        box_color_not_viz
-                    };
-                    let box_color = Color32::from_rgba_unmultiplied(r, g, b, alpha);
-                    let min_pos = pos2(box_middle_x - box_width / 2.0, head_screen_pos.y);
-                    let max_pos = pos2(min_pos.x + box_width, min_pos.y + box_height);
-                    let stroke = (1.0, box_color);
-                    ui.painter().rect_stroke(
-                        Rect {
-                            min: min_pos,
-                            max: max_pos,
-                        },
-                        0.0,
-                        stroke,
-                    );
-                }
-                if esp_settings.esp_visuals & EspVisualsFlag::Name as i32 != 0 {
-                    let is_love: LoveStatusCode = player_data
-                        .love_status
-                        .try_into()
-                        .unwrap_or(LoveStatusCode::Normal);
-
-                    let name_color = if is_love == LoveStatusCode::Love {
-                        Color32::from_rgb(231, 27, 100)
-                    } else if is_love == LoveStatusCode::Hate {
-                        Color32::RED
-                    } else if is_love == LoveStatusCode::Ambivalent {
-                        Color32::BLACK
-                    } else {
-                        Color32::from_rgba_unmultiplied(255, 255, 255, alpha)
-                    };
-
-                    let draw_pos = pos2(box_middle_x, head_screen_pos.y - 15.0);
-                    let nick_pos = pos2(draw_pos.x + 50.0, draw_pos.y);
-
-                    let level_text = format!("{}{}", s!("Lv."), xp_level(player_data.xp));
-                    let level_color = Color32::from_rgba_unmultiplied(0, 255, 0, alpha);
-
-                    ui.painter().text(
-                        draw_pos,
-                        Align2::RIGHT_CENTER,
-                        level_text,
-                        font_id.clone(),
-                        level_color,
-                    );
-                    ui.painter().text(
-                        nick_pos,
-                        Align2::CENTER_CENTER,
-                        player_data.player_name.to_owned(),
-                        font_id.clone(),
-                        name_color,
-                    );
-                }
-            }
-        })
 }
 
 pub fn world_to_screen(
-    from: &[f32; 3],
+    from: [f32; 3],
     view_matrix: &[f32; 16],
     screen_width: f32,
     screen_height: f32,
@@ -845,6 +1443,46 @@ fn xp_level(xp: i32) -> i32 {
 
     1 + array_size as i32 + ((xp - LEVELS[array_size - 1]) / 18000)
 }
+
+#[allow(dead_code)]
+fn toggle_ui_compact(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let desired_size = ui.spacing().interact_size.y * egui::vec2(2.0, 1.0);
+    let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, "")
+    });
+
+    if ui.is_rect_visible(rect) {
+        let how_on = ui.ctx().animate_bool_responsive(response.id, *on);
+        let visuals = ui.style().interact_selectable(&response, *on);
+        let rect = rect.expand(visuals.expansion);
+        let radius = 0.5 * rect.height();
+        ui.painter()
+            .rect(rect, radius, visuals.bg_fill, visuals.bg_stroke);
+        let circle_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), how_on);
+        let center = egui::pos2(circle_x, rect.center().y);
+        ui.painter()
+            .circle(center, 0.75 * radius, visuals.bg_fill, visuals.fg_stroke);
+    }
+
+    response
+}
+
+// A wrapper that allows the more idiomatic usage pattern: `ui.add(toggle_button(&mut my_bool))`
+/// iOS-style toggle switch.
+///
+/// ## Example:
+/// ``` ignore
+/// ui.add(toggle_button(&mut my_bool));
+/// ```
+pub fn toggle_button(on: &mut bool) -> impl egui::Widget + '_ {
+    move |ui: &mut egui::Ui| toggle_ui_compact(ui, on)
+}
+
 // // info ui
 // commands
 //     .spawn(NodeBundle {

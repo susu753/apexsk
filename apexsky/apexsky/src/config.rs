@@ -1,3 +1,4 @@
+use indexmap::IndexMap;
 use obfstr::obfstr as s;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ use crate::{aimbot::AimbotSettings, love_players::LovePlayer};
 #[repr(C)]
 #[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct EspVisuals {
+    pub bone: bool,
     pub r#box: bool,
     pub line: bool,
     pub distance: bool,
@@ -161,6 +163,7 @@ pub struct Config {
     pub(crate) love_player: Vec<LovePlayer>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) hate_player: Vec<LovePlayer>,
+    pub dlc: DlcConfig,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -182,6 +185,16 @@ pub struct DeviceConfig {
     pub use_qemu_qmp: bool,
 }
 
+#[derive(Clone, Deserialize, Serialize, Debug, Default)]
+pub struct DlcConfig {
+    pub install: IndexMap<String, InstalledDlcItem>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Debug)]
+pub struct InstalledDlcItem {
+    pub checksum: String,
+}
+
 #[repr(C)]
 #[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct Settings {
@@ -196,6 +209,7 @@ pub struct Settings {
     pub aimbot_hot_key_1: i32,
     pub aimbot_hot_key_2: i32,
     pub trigger_bot_hot_key: i32,
+    pub quick_looting_hot_key: i32,
     pub loot_filled_toggle: bool,
     pub player_filled_toggle: bool,
     pub super_key_toggle: bool,
@@ -244,11 +258,12 @@ pub struct Settings {
 impl Default for EspVisuals {
     fn default() -> Self {
         Self {
+            bone: true,
             r#box: true,
             line: false,
             distance: false,
-            health_bar: false,
-            shield_bar: false,
+            health_bar: true,
+            shield_bar: true,
             name: false,
             damage: true,
         }
@@ -396,7 +411,7 @@ impl Default for EspServiceConfig {
     fn default() -> Self {
         Self {
             listen: s!("[::1]:50051").parse().unwrap(),
-            accept_http1: false,
+            accept_http1: true,
         }
     }
 }
@@ -439,6 +454,7 @@ impl Default for Settings {
             // Done with Gamepad or Keyboard config
             // triggerbot?
             trigger_bot_hot_key: 81,
+            quick_looting_hot_key: 79,
             // Terminal Stuff
             loot_filled_toggle: true,
             player_filled_toggle: true,
@@ -454,7 +470,7 @@ impl Default for Settings {
             player_glow_love_user: true,
             weapon_model_glow: false,
             kbd_backlight_control: false,
-            deathbox: false,
+            deathbox: true,
             esp: true,
             esp_visuals: EspVisuals::default(),
             mini_map_radar: true,
@@ -468,7 +484,7 @@ impl Default for Settings {
             map_radar_testing: false,
             show_aim_target: true,
             game_fps: 75.0,       // Game FPS for aim prediction
-            calc_game_fps: false, // Automatic calculation of game fps
+            calc_game_fps: true, // Automatic calculation of game fps
             firing_range: false,
             // Player Glow Color and Brightness.
             // inside fill
