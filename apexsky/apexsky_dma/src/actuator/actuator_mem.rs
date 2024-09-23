@@ -88,6 +88,11 @@ impl MemAimHelper {
         apex_base: u64,
         force_attack_state: i32,
     ) -> anyhow::Result<()> {
+        // TODO: Offset not updated
+        if G_OFFSETS.in_attack == 0 {
+            return Ok(());
+        }
+
         AccessType::mem_write_typed::<i32>(
             apex_base + G_OFFSETS.in_attack + 0x8,
             &force_attack_state,
@@ -104,6 +109,11 @@ impl MemAimHelper {
         apex_base: u64,
         force_use_state: i32,
     ) -> anyhow::Result<()> {
+        // TODO: Offset not updated
+        if G_OFFSETS.in_use == 0 {
+            return Ok(());
+        }
+
         AccessType::mem_write_typed::<i32>(apex_base + G_OFFSETS.in_use + 0x8, &force_use_state, 0)
             .with_priority(50)
             .dispatch(mem)
@@ -125,11 +135,14 @@ impl AimActuator for MemAimActuator<'_> {
                 if let Some(delta) = action.shift_angles {
                     // calc and check target view angles
                     let mut update_angles = math::add(self.view_angles, delta);
-                    if update_angles[0].abs() > 360.0
+                    if update_angles[0].is_nan()
+                        || update_angles[1].is_nan()
+                        || update_angles[2].is_nan()
+                        || update_angles[0].abs() > 360.0
                         || update_angles[1].abs() > 360.0
                         || update_angles[2].abs() > 360.0
                     {
-                        tracing::warn!(?update_angles, "{}", s!("got invalid target view_angles"));
+                        tracing::warn!(?update_angles, ?self.view_angles, ?delta, "{}", s!("got invalid target view_angles"));
                         anyhow::bail!("{}", s!("got invalid target view_angles"))
                     }
                     normalize_angles(&mut update_angles);
