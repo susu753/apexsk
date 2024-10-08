@@ -19,12 +19,30 @@ fn main() {
 #[cfg(feature = "native")]
 fn init_logger() -> tracing_appender::non_blocking::WorkerGuard {
     use obfstr::obfstr as s;
+    use once_cell::sync::Lazy;
+    use std::path::PathBuf;
     use tracing::Level;
     use tracing_subscriber::{fmt::writer::MakeWriterExt, layer::SubscriberExt, EnvFilter};
 
+    static DATA_DIR: Lazy<PathBuf> = Lazy::new(|| {
+        if cfg!(unix)
+            && std::env::current_exe()
+                .is_ok_and(|exe| exe.starts_with(s!("/usr/bin")) || exe.starts_with(s!("/bin")))
+        {
+            homedir::my_home()
+                .unwrap()
+                .unwrap()
+                .join(".local")
+                .join("share")
+                .join(obfstr::obfstr!("apexsky"))
+        } else {
+            std::env::current_dir().unwrap()
+        }
+    });
+
     let print = true;
     let (non_blocking, guard) = tracing_appender::non_blocking(tracing_appender::rolling::daily(
-        s!("log"),
+        DATA_DIR.join(s!("log")),
         s!("overlay.log"),
     ));
 

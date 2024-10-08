@@ -73,8 +73,23 @@ impl Default for UiPersistance {
 impl UiPersistance {
     #[cfg(feature = "native")]
     fn file_path() -> anyhow::Result<std::path::PathBuf> {
-        let current_dir = std::env::current_dir()?;
-        Ok(current_dir.join(s!("./overlay-ui.json")))
+        static CONFIG_DIR: Lazy<std::path::PathBuf> = Lazy::new(|| {
+            if cfg!(unix)
+                && std::env::current_exe()
+                    .is_ok_and(|exe| exe.starts_with(s!("/usr/bin")) || exe.starts_with(s!("/bin")))
+            {
+                homedir::my_home()
+                    .unwrap()
+                    .unwrap()
+                    .join(".config")
+                    .join(s!("apexsky"))
+            } else {
+                std::env::current_dir().expect(s!("Failed to determine the current directory"))
+            }
+        });
+        std::fs::create_dir_all(CONFIG_DIR.as_path())
+            .expect(s!("Failed to create config directory"));
+        Ok(CONFIG_DIR.join(s!("./overlay-ui.json")))
     }
 
     #[cfg(feature = "native")]
@@ -222,7 +237,7 @@ pub fn ui_system(
         }
     }
 
-    if let Some(esp_settings) = esp_system.as_ref().map(|v| v.get_esp_settings()) {
+    if let Some(esp_settings) = esp_system.as_ref().and_then(|v| v.get_esp_settings()) {
         let screen_wh = (
             esp_settings.screen_width as f32,
             esp_settings.screen_height as f32,
@@ -663,12 +678,17 @@ pub fn ui_system(
             }
         });
 
-    if let Some(ref esp_system_connected) = esp_system {
-        let esp_settings = esp_system_connected.get_esp_settings();
-        let esp_data = esp_system_connected.get_esp_data();
-        let esp_loots = esp_system_connected.get_esp_loots();
-        let view_player = esp_system_connected.get_view_player();
-
+    if let Some((esp_settings, esp_data, esp_loots, view_player, is_teammate_view)) =
+        esp_system.as_ref().and_then(|esp| {
+            Some((
+                esp.get_esp_settings()?,
+                esp.get_esp_data(),
+                esp.get_esp_loots(),
+                esp.get_view_player(),
+                esp.get_view_teammate().is_some(),
+            ))
+        })
+    {
         let panel_frame = egui::Frame {
             fill: Color32::TRANSPARENT, //ctx.style().visuals.window_fill(),
             rounding: 10.0.into(),
@@ -678,7 +698,6 @@ pub fn ui_system(
         };
 
         // Draw 2D ESP for local player
-        let is_teammate_view = esp_system_connected.get_view_teammate().is_some();
         CentralPanel::default().frame(panel_frame).show(ctx, |ui| {
             if !is_teammate_view {
                 esp_2d_ui(ui, esp_data, esp_settings, esp_loots, view_player);

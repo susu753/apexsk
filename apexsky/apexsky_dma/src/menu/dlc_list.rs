@@ -196,12 +196,9 @@ impl TableApp {
 }
 
 async fn read_packages() -> anyhow::Result<Vec<Data>> {
-    let current_dir = std::env::current_dir()?;
-    let dlc_dir = current_dir.join("dlc");
-
     let mut install_mgr = PackageManager::default();
 
-    for entry in std::fs::read_dir(dlc_dir)? {
+    for entry in std::fs::read_dir(crate::MODS_DIR.as_path())? {
         let entry = entry?;
         let path = entry.path();
 

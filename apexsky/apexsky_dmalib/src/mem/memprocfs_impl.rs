@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context};
+use apexsky_utils::get_runner_home_dir;
 use memprocfs::{Vmm, VmmProcess, VmmScatterMemory, FLAG_NOCACHE};
 use obfstr::obfstr as s;
 use once_cell::sync::Lazy;
@@ -42,20 +43,35 @@ impl MemProcFsOs {
 
         tracing::info!("{}{}", s!("leechcore device: "), device);
 
-        // MemProcFS Rust requires full path to vmm.dll/so so use current directory
-        let vmm_path: String = match env::current_dir() {
-            Ok(current_dir) => {
-                let current_dir_str = current_dir.to_str().unwrap();
-                if cfg!(windows) {
-                    format!("{}{}", current_dir_str, s!("\\vmm.dll"))
-                } else {
-                    format!("{}{}", current_dir_str, s!("/vmm.so"))
+        // MemProcFS Rust requires full path to vmm.dll/so
+        let vmm_path: String = (|| {
+            if cfg!(unix) {
+                // try ~/.local/lib/memprocfs/vmm.so
+                if let Some(local_lib) = get_runner_home_dir().map(|home| {
+                    home.join(s!(".local"))
+                        .join(s!("lib"))
+                        .join(s!("memprocfs"))
+                        .join(s!("vmm.so"))
+                }) {
+                    if local_lib.try_exists().is_ok_and(|exists| exists) {
+                        return anyhow::Ok(local_lib.to_str().unwrap().to_string());
+                    }
                 }
             }
-            Err(_) => {
-                return Err(anyhow!("{}", s!("App: Unable to get current directory.")));
+
+            let current_dir = env::current_dir()
+                .map_err(|_| anyhow!("{}", s!("App: Unable to get current directory.")))?;
+
+            if cfg!(windows) {
+                Ok(current_dir
+                    .join(s!("vmm.dll"))
+                    .to_str()
+                    .unwrap()
+                    .to_string())
+            } else {
+                Ok(current_dir.join(s!("vmm.so")).to_str().unwrap().to_string())
             }
-        };
+        })()?;
 
         // Initialize Vmm on passed parameters, always expect this to be ok, so panic if it's not
         let vmm = {
@@ -80,8 +96,8 @@ impl MemProcFsOs {
 }
 
 impl super::MemOs for MemProcFsOs {
-    fn open_proc<'a>(&'a mut self, name: String) -> anyhow::Result<super::MemProcImpl<'a>> {
-        let process = self.vmm.process_from_name(&name)?;
+    fn open_proc<'a>(&'a mut self, name: &str) -> anyhow::Result<super::MemProcImpl<'a>> {
+        let process = self.vmm.process_from_name(name)?;
 
         if let Ok(procinfo) = process.info() {
             println!("{}{:?}", s!("struct   -> "), procinfo);
@@ -94,14 +110,14 @@ impl super::MemOs for MemProcFsOs {
             println!("{}{:?}", s!("SID      -> "), procinfo.sid);
         }
 
-        fix_dtb(&self.vmm, &process, &name).map_err(|e| {
+        fix_dtb(&self.vmm, &process, name).map_err(|e| {
             tracing::warn!(%e, ?e);
             e
         })?;
 
-        let process_base = process.get_module_base(&name)?;
+        let process_base = process.get_module_base(name)?;
 
-        println!("{}{}{:x}", name, s!(" module found: 0x"), process_base);
+        tracing::info!(?name, "{}{:x}", s!("module found: 0x"), process_base);
 
         Ok(super::MemProcImpl::Vmm(MemProcFSProc {
             base_addr: process_base,
@@ -112,8 +128,13 @@ impl super::MemOs for MemProcFsOs {
 }
 
 impl<'a> MemProc for MemProcFSProc<'a> {
-    fn get_proc_baseaddr(&self) -> u64 {
+    #[inline]
+    fn get_base_addr(&self) -> u64 {
         self.base_addr
+    }
+
+    fn set_base_addr(&mut self, base_addr: u64) {
+        self.base_addr = base_addr;
     }
 
     fn check_proc_status(&mut self) -> super::ProcessStatus {

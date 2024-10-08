@@ -13,7 +13,6 @@ use self::apexsky_menu::TerminalMenu;
 // ANCHOR: model
 #[derive(Debug)]
 pub struct Model {
-    counter: i32,
     running_state: RunningState,
     key_input: String,
     input_callback: Option<fn(String) -> Option<String>>,
@@ -51,7 +50,6 @@ pub fn main(default_memu: Box<dyn apexsky_menu::MenuState>) -> anyhow::Result<()
     let mut terminal = tui::init_terminal()?;
     let mut apex_menu = apexsky_menu::TerminalMenu::new(
         Model {
-            counter: 0,
             running_state: RunningState::default(),
             key_input: String::new(),
             input_callback: None,
@@ -85,7 +83,7 @@ pub fn main(default_memu: Box<dyn apexsky_menu::MenuState>) -> anyhow::Result<()
         let mut current_msg = handle_event(apex_menu.app_model())?;
 
         // Process updates as long as they return a non-‌​‌‌​​​‌‌‌‍‌​‌‌​‌​​​‌‍‌​‌‌​​‌​‌‌‍‌​‌‌‌​‌​​‌‍‌​‌‌‌​‌​​‌‍‌​‌‌​‌‌‌‌‌‍‌​‌‌‌‌​​‌‌‍‌​‌‌​​​​‌‌‍‌​‌‌‌​​​​‌‍‌​‌‌​​‌​‌‌‍‌​‌‌‌‌​​​‌‍‌​‌‌‌​‌​​‌‍‌​‌‌‌​‌​‌‌‍‌​‌‌​‌​​‌‌‍‌​‌‌​‌‌​‌‌‍‌​‌‌​​‌​‌‌‍‌​‌‌​‌‌‌​‌‍‌​‌‌‌​‌​‌‌None message
-        while current_msg != None {
+        while current_msg.is_some() {
             current_msg = update(&mut apex_menu, current_msg.unwrap());
         }
     }
@@ -195,7 +193,7 @@ fn update(apex_menu: &mut TerminalMenu, msg: Message) -> Option<Message> {
             model.input_buf.insert(model.input_buf.len(), c);
         }
         Message::Delete => {
-            if model.input_buf.len() > 0 {
+            if !model.input_buf.is_empty() {
                 model.input_buf.remove(model.input_buf.len() - 1);
             }
         }
